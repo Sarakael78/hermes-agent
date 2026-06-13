@@ -8,7 +8,9 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -245,6 +247,177 @@ def test_dashboard_initial_board_uses_backend_current_when_unpinned():
     assert "if (!storedBoard && !board && data && data.current)" in js
     assert "setBoard(data.current);" in js
     assert 'readSelectedBoard() || "default"' not in js
+
+
+def test_dashboard_profile_rows_render_model_provider_visibility():
+    """Profile roster rows must expose configured model/provider and unknowns."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "function profileModelProviderLabel(profile)" in js
+    assert "hermes-kanban-profile-model" in js
+    assert "Configured provider/model from this profile's local config.yaml" in js
+    assert "Task-level model overrides may differ" in js
+
+    helper_src = js[
+        js.index("  function profileModelProviderLabel") : js.index(
+            "\n  function ProfileDescriptionRow",
+            js.index("  function profileModelProviderLabel"),
+        )
+    ]
+    script = f"""
+{helper_src}
+const profiles = [
+  {{ provider: "openai-codex", model: "gpt-5.5" }},
+  {{ provider: "anthropic", model: "" }},
+  {{ provider: "", model: "local/llama" }},
+  {{ provider: "", model: "" }},
+  {{}},
+];
+console.log(JSON.stringify(profiles.map(profileModelProviderLabel)));
+"""
+    completed = subprocess.run(
+        ["node", "-e", script],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    labels = json.loads(completed.stdout)
+
+    assert labels == [
+        "openai-codex / gpt-5.5",
+        "anthropic / unknown model",
+        "local/llama",
+        "Unknown model/provider",
+        "Unknown model/provider",
+    ]
+
+
+def test_dashboard_board_switcher_sort_options_reorder_board_list():
+    """Board switcher sort choices must drive the displayed option order."""
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    js = bundle.read_text()
+
+    assert "BOARD_SORT_OPTIONS" in js
+    assert "Default first" in js
+    assert "Alphabetical" in js
+    assert "Date/time" in js
+    assert "boards?sort=${encodeURIComponent(sortMode)}" in js
+    assert "}, [board, boardSort]);" in js
+    assert "sortBoardList(list, props.sortMode || BOARD_SORT_DEFAULT)" in js
+    assert "sortBoardList(boards, props.sortMode || BOARD_SORT_DEFAULT)" in js
+    assert "sortMode: boardSort" in js
+
+    helper_src = js[
+        js.index("  const BOARD_SORT_DEFAULT") : js.index("\n  function BoardSwitcher", js.index("  const BOARD_SORT_OPTIONS"))
+    ]
+    script = f"""
+{helper_src}
+const boards = [
+  {{ slug: "zeta", name: "Zeta", created_at: 30 }},
+  {{ slug: "default", name: "Default", created_at: null }},
+  {{ slug: "beta", name: "Beta", created_at: 20 }},
+  {{ slug: "alpha", name: "Alpha", created_at: 10 }},
+  {{ slug: "gamma", name: "Beta", created_at: "not-a-date" }},
+];
+const result = {{
+  defaultMode: BOARD_SORT_DEFAULT,
+  options: BOARD_SORT_OPTIONS.map((option) => [option.value, option.label]),
+  original: boards.map((b) => b.slug),
+  modes: {{}},
+}};
+for (const mode of ["default_first", "alphabetical", "datetime_desc", undefined]) {{
+  const key = mode || "fallback";
+  result.modes[key] = sortBoardList(boards, mode || BOARD_SORT_DEFAULT).map((b) => b.slug);
+}}
+result.afterSortCalls = boards.map((b) => b.slug);
+console.log(JSON.stringify(result));
+"""
+    completed = subprocess.run(
+        ["node", "-e", script],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result = json.loads(completed.stdout)
+
+    assert result["defaultMode"] == "default_first"
+    assert result["options"] == [
+        ["default_first", "Default first"],
+        ["alphabetical", "Alphabetical"],
+        ["datetime_desc", "Date/time (newest first)"],
+    ]
+    assert result["original"] == ["zeta", "default", "beta", "alpha", "gamma"]
+    assert result["afterSortCalls"] == result["original"]
+    assert result["modes"] == {
+        "default_first": ["default", "alpha", "beta", "gamma", "zeta"],
+        "alphabetical": ["alpha", "beta", "gamma", "default", "zeta"],
+        "datetime_desc": ["zeta", "beta", "alpha", "gamma", "default"],
+        "fallback": ["default", "alpha", "beta", "gamma", "zeta"],
+    }
+    assert len({tuple(order) for order in result["modes"].values()}) == 3
+
+
+def test_boards_endpoint_sort_modes_cover_default_alpha_and_datetime(client):
+    """The boards endpoint honours every dropdown sort mode."""
+    fixtures = [
+        ("zeta", "Zeta", 30),
+        ("beta", "Beta", 20),
+        ("alpha", "Alpha", 10),
+        ("gamma", "Beta", "not-a-date"),
+    ]
+    for slug, name, created_at in fixtures:
+        kb.create_board(slug, name=name)
+        path = kb.board_metadata_path(slug)
+        meta = json.loads(path.read_text(encoding="utf-8"))
+        meta["created_at"] = created_at
+        path.write_text(json.dumps(meta), encoding="utf-8")
+
+    expected_orders = {
+        "default_first": ["default", "alpha", "beta", "gamma", "zeta"],
+        "alphabetical": ["alpha", "beta", "gamma", "default", "zeta"],
+        "datetime_desc": ["zeta", "beta", "alpha", "gamma", "default"],
+    }
+    for mode, expected in expected_orders.items():
+        r = client.get(f"/api/plugins/kanban/boards?sort={mode}")
+        assert r.status_code == 200, r.text
+        assert [b["slug"] for b in r.json()["boards"]] == expected
+
+    r = client.get("/api/plugins/kanban/boards")
+    assert r.status_code == 200, r.text
+    assert [b["slug"] for b in r.json()["boards"]] == expected_orders["default_first"]
+
+
+def test_boards_endpoint_hides_archived_schema_only_ghost_from_active_tab(client):
+    """Dashboard Active boards must not render empty live ghosts of archives."""
+    slug = "dashboard-archived-ghost"
+    kb.create_board(slug, name="Dashboard Archived Ghost")
+    result = kb.remove_board(slug, archive=True)
+    archived_path = Path(result["new_path"])
+    assert archived_path.exists()
+
+    ghost_dir = kb.board_dir(slug)
+    ghost_dir.mkdir(parents=True)
+    kb.init_db(db_path=ghost_dir / "kanban.db")
+
+    r = client.get("/api/plugins/kanban/boards")
+    assert r.status_code == 200, r.text
+    assert slug not in [b["slug"] for b in r.json()["boards"]]
+
+    r = client.get("/api/plugins/kanban/boards?include_archived=true")
+    assert r.status_code == 200, r.text
+    boards = r.json()["boards"]
+    assert slug not in [b["slug"] for b in boards if not b.get("archived")]
+    assert any(
+        b.get("archived") and b.get("original_slug") == slug
+        for b in boards
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2160,6 +2333,112 @@ def test_specify_no_aux_client_surfaces_reason(client, monkeypatch):
     assert detail["status"] == "triage"
 
 
+def test_boards_overview_excludes_archived_and_adds_breakdown(client):
+    """GET /boards is the overview surface: non-archived boards only by default,
+    plus compact per-board status/activity/outcome breakdowns.
+    """
+    kb.create_board("active", name="Active Board")
+    kb.create_board("sleeping", name="Archived Board")
+    kb.write_board_metadata("sleeping", archived=True)
+
+    conn = kb.connect(board="active")
+    try:
+        running = kb.create_task(conn, title="worker in flight", assignee="bot")
+        blocked = kb.create_task(conn, title="needs input", assignee="bot")
+        review = kb.create_task(conn, title="needs review", assignee="reviewer")
+        done = kb.create_task(conn, title="finished", assignee="bot")
+        kb.claim_task(conn, running)
+        kb.block_task(conn, blocked, reason="waiting on David")
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (review,))
+        kb.claim_task(conn, done)
+        kb.complete_task(conn, done, summary="completed handoff", metadata={"approved": True})
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/boards")
+    assert r.status_code == 200, r.text
+    data = r.json()
+    slugs = [b["slug"] for b in data["boards"]]
+    assert "active" in slugs
+    assert "sleeping" not in slugs
+
+    active = next(b for b in data["boards"] if b["slug"] == "active")
+    assert active["counts"]["running"] == 1
+    assert active["counts"]["blocked"] == 1
+    assert active["counts"]["review"] == 1
+    assert active["counts"]["done"] == 1
+    assert active["breakdown"]["status_counts"]["running"] == 1
+    assert active["breakdown"]["signals"] == {
+        "active": 3,
+        "running": 1,
+        "blocked": 1,
+        "review": 1,
+        "ready": 0,
+        "done": 1,
+    }
+    assert active["breakdown"]["recent_activity_at"] is not None
+    assert active["breakdown"]["latest_completed"]["outcome"] == "completed"
+    assert active["breakdown"]["latest_completed"]["summary"] == "completed handoff"
+
+
+def test_boards_bulk_archive_requires_confirmation_and_archives_only_fixtures(client):
+    kb.create_board("keep-me")
+    kb.create_board("archive-a")
+    kb.create_board("archive-b")
+
+    refused = client.post(
+        "/api/plugins/kanban/boards/bulk-archive",
+        json={"slugs": ["archive-a", "archive-b"]},
+    )
+    assert refused.status_code == 409
+    assert kb.board_exists("archive-a")
+    assert kb.board_exists("archive-b")
+
+    r = client.post(
+        "/api/plugins/kanban/boards/bulk-archive",
+        json={"slugs": ["archive-a", "default", "archive-b"], "confirm": True, "confirmation": "ARCHIVE"},
+    )
+    assert r.status_code == 200, r.text
+    results = {row["slug"]: row for row in r.json()["results"]}
+    assert results["archive-a"]["ok"] is True
+    assert results["archive-b"]["ok"] is True
+    assert results["default"]["ok"] is False
+    assert "default" in results["default"]["error"]
+    assert not kb.board_exists("archive-a")
+    assert not kb.board_exists("archive-b")
+    assert kb.board_exists("keep-me")
+    remaining = client.get("/api/plugins/kanban/boards").json()["boards"]
+    assert [b["slug"] for b in remaining] == ["default", "keep-me"]
+
+    archived = client.get(
+        "/api/plugins/kanban/boards", params={"include_archived": True}
+    ).json()["boards"]
+    archived_rows = [b for b in archived if b.get("archived")]
+    archived_originals = {b.get("original_slug") for b in archived_rows}
+    assert {"archive-a", "archive-b"}.issubset(archived_originals)
+    assert all("archive_path" in b and "db_path" in b for b in archived_rows)
+
+
+def test_dashboard_boards_overview_bulk_archive_ui_tokens():
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+
+    assert "function BoardsOverview" in js
+    assert "BOARD_OVERVIEW_TABS" in js
+    assert "Active boards" in js
+    assert "Recently completed" in js
+    assert "Archived boards" in js
+    assert "boardOverviewTabKey" in js
+    assert "include_archived=true" in js
+    assert "selectedBoardSlugs" in js
+    assert "boards/bulk-archive" in js
+    assert "confirmation: \"ARCHIVE\"" in js
+    assert "hermes-kanban-board-overview" in js
+    assert "hermes-kanban-board-overview" in css
+    assert "hermes-kanban-board-overview-tabs" in css
+
+
 def test_board_endpoint_accepts_explicit_board_default_param(client):
     """GET /board?board=default must not fall through to env/current-file resolution.
 
@@ -2196,7 +2475,7 @@ def test_dashboard_requests_default_board_explicitly():
     dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
 
     assert "SDK.fetchJSON(withBoard(`${API}/config`, board))" in dist
-    assert "SDK.fetchJSON(withBoard(`${API}/boards`, board))" in dist
+    assert "SDK.fetchJSON(withBoard(`${API}/boards?sort=${encodeURIComponent(sortMode)}&include_archived=true`, board))" in dist
     assert "}, [loadBoardList, switchBoard, board]);" in dist
 
 
@@ -2252,3 +2531,32 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+
+def test_dashboard_columns_use_responsive_count_aware_layout():
+    """Eight visible columns should fit at desktop widths while narrow views can scroll."""
+    repo_root = Path(__file__).resolve().parents[2]
+    dist_root = repo_root / "plugins" / "kanban" / "dashboard" / "dist"
+    js = (dist_root / "index.js").read_text()
+    css = (dist_root / "style.css").read_text()
+
+    assert "--kanban-column-count" in css
+    assert "grid-template-columns: repeat(var(--kanban-column-count" in css
+    assert "minmax(min(8.5rem, 100%), 1fr)" in css
+    assert "gap: 0.5rem;" in css
+    assert "flex: 0 0 280px" not in css
+    assert '"--kanban-column-count": String(props.board.columns.length || 1)' in js
+    assert "style: columnStyle" in js
+
+    for token in (
+        'scheduled: "Scheduled"',
+        'review: "Review"',
+        'scheduled: "Delayed or waiting until a scheduled time"',
+        'review: "Completed work awaiting human review"',
+        'scheduled: "hermes-kanban-dot-scheduled"',
+        'review: "hermes-kanban-dot-review"',
+    ):
+        assert token in js
+
+    assert ".hermes-kanban-dot-scheduled" in css
+    assert ".hermes-kanban-dot-review" in css

@@ -311,6 +311,53 @@ class TestBoardCRUD:
 
 
 # ---------------------------------------------------------------------------
+# Board ordering
+# ---------------------------------------------------------------------------
+
+class TestBoardOrdering:
+    def test_list_boards_datetime_sort_uses_created_at_newest_first(self, fresh_home):
+        """Date/time mode is explicitly created_at DESC, with deterministic tie breaks."""
+        kb.create_board("older", name="Zulu")
+        kb.create_board("newer", name="Alpha")
+        kb.create_board("same-a", name="Bravo")
+        kb.create_board("same-b", name="Charlie")
+
+        overrides = {
+            "older": 100,
+            "newer": 300,
+            "same-a": 200,
+            "same-b": 200,
+        }
+        for slug, created_at in overrides.items():
+            path = kb.board_metadata_path(slug)
+            meta = json.loads(path.read_text(encoding="utf-8"))
+            meta["created_at"] = created_at
+            path.write_text(json.dumps(meta), encoding="utf-8")
+
+        boards = kb.list_boards(include_archived=False, sort_mode="datetime_desc")
+
+        # Named boards sort newest-first by created_at. Equal timestamps fall
+        # back to display name/slug so the order is stable. The legacy default
+        # board has no created_at timestamp and therefore sorts last in this
+        # mode rather than being artificially pinned first.
+        assert [b["slug"] for b in boards] == [
+            "newer",
+            "same-a",
+            "same-b",
+            "older",
+            "default",
+        ]
+
+    def test_list_boards_default_sort_stays_default_first_then_slug_alpha(self, fresh_home):
+        kb.create_board("z-last", name="A display name")
+        kb.create_board("a-first", name="Z display name")
+
+        boards = kb.list_boards(include_archived=False, sort_mode="default")
+
+        assert [b["slug"] for b in boards] == ["default", "a-first", "z-last"]
+
+
+# ---------------------------------------------------------------------------
 # Connection isolation
 # ---------------------------------------------------------------------------
 
