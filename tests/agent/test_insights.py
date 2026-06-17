@@ -270,6 +270,7 @@ class TestInsightsPopulated:
         assert "platforms" in report
         assert "tools" in report
         assert "activity" in report
+        assert "comparison" in report
         assert "top_sessions" in report
 
     def test_overview_session_count(self, populated_db):
@@ -289,12 +290,25 @@ class TestInsightsPopulated:
         expected_output = 15000 + 8000 + 40000 + 5000
         assert overview["total_input_tokens"] == expected_input
         assert overview["total_output_tokens"] == expected_output
+        assert overview["total_visible_tokens"] == expected_input + expected_output
+        assert overview["total_cache_tokens"] == 0
         assert overview["total_tokens"] == expected_input + expected_output
+        assert overview["data_span_days"] == 10
+        assert overview["avg_sessions_per_data_day"] == pytest.approx(0.4)
+        assert overview["avg_messages_per_data_day"] == pytest.approx(26 / 10)
+        assert overview["avg_total_tokens_per_data_day"] == pytest.approx(248000 / 10)
 
-    def test_overview_cost_positive(self, populated_db):
+    def test_overview_efficiency_metrics(self, populated_db):
         engine = InsightsEngine(populated_db)
         report = engine.generate(days=30)
-        assert report["overview"]["estimated_cost"] > 0
+        overview = report["overview"]
+
+        assert overview["tokens_per_message"] > 0
+        assert overview["visible_tokens_per_message"] > 0
+        assert overview["sessions_per_active_hour"] > 0
+        assert overview["messages_per_active_hour"] > 0
+        assert overview["tokens_per_active_hour"] > 0
+        assert overview["cache_read_share"] == 0
 
     def test_overview_duration_stats(self, populated_db):
         engine = InsightsEngine(populated_db)
@@ -304,6 +318,22 @@ class TestInsightsPopulated:
         # All 4 sessions have durations
         assert overview["total_hours"] > 0
         assert overview["avg_session_duration"] > 0
+
+    def test_overview_cost_positive(self, populated_db):
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30)
+        assert report["overview"]["estimated_cost"] > 0
+
+    def test_previous_period_comparison(self, populated_db):
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30)
+        comparison = {m["key"]: m for m in report["comparison"]["metrics"]}
+
+        assert comparison["total_sessions"]["current"] == 4
+        assert comparison["total_sessions"]["previous"] == 1
+        assert comparison["total_tokens"]["current"] == 248000
+        assert comparison["total_tokens"]["previous"] == 7000
+        assert comparison["total_tokens"]["delta"] == 241000
 
     def test_model_breakdown(self, populated_db):
         engine = InsightsEngine(populated_db)
@@ -319,6 +349,8 @@ class TestInsightsPopulated:
         # Claude-sonnet has 2 sessions (s1 + s4)
         claude = next(m for m in models if "claude-sonnet" in m["model"])
         assert claude["sessions"] == 2
+        assert claude["avg_visible_tokens_per_session"] > 0
+        assert claude["avg_cache_read_per_session"] == 0
 
     def test_platform_breakdown(self, populated_db):
         engine = InsightsEngine(populated_db)
@@ -332,6 +364,8 @@ class TestInsightsPopulated:
 
         cli = next(p for p in platforms if p["platform"] == "cli")
         assert cli["sessions"] == 2  # s1 + s3
+        assert cli["avg_messages_per_session"] > 0
+        assert cli["avg_visible_tokens_per_session"] > 0
 
     def test_tool_breakdown(self, populated_db):
         engine = InsightsEngine(populated_db)
@@ -392,6 +426,12 @@ class TestInsightsPopulated:
         assert activity["active_days"] >= 1
         assert activity["busiest_day"] is not None
         assert activity["busiest_hour"] is not None
+        assert activity["peak_windows"]["sessions"] is not None
+        assert activity["peak_windows"]["tokens"] is not None
+        assert len(activity["top_windows"]) <= 5
+        assert len(activity["peak_days"]) <= 5
+        assert len(activity["hour_session_heatmap"]) == 24
+        assert len(activity["hour_token_heatmap"]) == 24
 
     def test_top_sessions(self, populated_db):
         engine = InsightsEngine(populated_db)
@@ -401,8 +441,20 @@ class TestInsightsPopulated:
         labels = [t["label"] for t in top]
         assert "Longest session" in labels
         assert "Most messages" in labels
-        assert "Most tokens" in labels
+        assert "Most visible tokens" in labels
+        assert "Most total tokens" in labels
         assert "Most tool calls" in labels
+
+    def test_top_sessions_includes_cache_read_when_present(self, db):
+        db.create_session(session_id="s1", source="cli", model="test-model")
+        db.update_token_counts("s1", input_tokens=100, output_tokens=50, cache_read_tokens=900)
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        labels = [t["label"] for t in report["top_sessions"]]
+
+        assert "Most cache read" in labels
 
     def test_source_filter_cli(self, populated_db):
         engine = InsightsEngine(populated_db)
@@ -462,10 +514,17 @@ class TestTerminalFormatting:
 
         assert "Input tokens" in text
         assert "Output tokens" in text
-        # Cost and cache metrics are intentionally hidden (pricing was unreliable).
+        assert "Visible tokens" in text
+        assert "Data covered:" in text
+        assert "Daily avg:" in text
+        assert text.count("Cache read") >= 3
+        assert text.count("Cache write") >= 3
+        assert "Trend vs previous 30 days" in text
+        assert "Hourly Peaks" in text
+        assert "Peak days (by tokens)" in text
+        assert "Top hourly windows (by tokens)" in text
+        # Cost remains hidden in the terminal view.
         assert "Est. cost" not in text
-        assert "Cache read" not in text
-        assert "Cache write" not in text
 
     def test_terminal_format_shows_platforms(self, populated_db):
         engine = InsightsEngine(populated_db)
@@ -516,13 +575,14 @@ class TestGatewayFormatting:
         assert "**" in text  # Markdown bold
 
     def test_gateway_format_hides_cost(self, populated_db):
-        """Gateway format omits dollar figures and internal cache details."""
+        """Gateway format omits dollar figures but includes cache-aware summaries."""
         engine = InsightsEngine(populated_db)
         report = engine.generate(days=30)
         text = engine.format_gateway(report)
 
         assert "$" not in text
-        assert "cache" not in text.lower()
+        assert "cache" in text.lower()
+        assert "Trend:" in text
 
     def test_gateway_format_shows_models(self, populated_db):
         engine = InsightsEngine(populated_db)
@@ -531,6 +591,8 @@ class TestGatewayFormatting:
 
         assert "Models" in text
         assert "sessions" in text
+        assert "Coverage:" in text
+        assert "Daily avg:" in text
 
 
 # =========================================================================

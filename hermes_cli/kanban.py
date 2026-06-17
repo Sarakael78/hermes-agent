@@ -491,6 +491,45 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit JSON (structured) instead of the default human table",
     )
 
+    # --- sweep (bounded maintenance report) ---
+    p_sweep = sub.add_parser(
+        "sweep",
+        aliases=["sweeper"],
+        help="Dry-run Kanban maintenance sweep across local non-archived boards",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Dry-run Kanban maintenance sweep across local non-archived boards.\n\n"
+            "The command is report-only by default and can emit a deterministic "
+            "JSON report for audit/review. --apply is deliberately narrow: it "
+            "only promotes dependency-satisfied todo tasks already marked safe "
+            "by the report. It does not reclaim, unblock, spawn, archive, delete "
+            "or dispatch workers, and does not touch profiles, config, gateway, "
+            "deploys, or external services."
+        ),
+    )
+    p_sweep.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON report",
+    )
+    p_sweep.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply only explicitly safe local actions (currently dependency-satisfied todo promotion)",
+    )
+    p_sweep.add_argument(
+        "--reason",
+        default=None,
+        help="Audit note included in apply output; no external action is performed",
+    )
+    p_sweep.add_argument(
+        "--stale-timeout",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="Classify running tasks stale after this many seconds without heartbeat",
+    )
+
     # --- link / unlink ---
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
     p_link.add_argument("parent_id")
@@ -932,6 +971,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
+            "sweep":    _cmd_sweep,
+            "sweeper":  _cmd_sweep,
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
@@ -1662,6 +1703,48 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
         f"{profile or '(unassigned)'}"
         + (" (claim reclaimed)" if getattr(args, "reclaim", False) else "")
     )
+    return 0
+
+
+def _cmd_sweep(args: argparse.Namespace) -> int:
+    """Bounded board-wide maintenance classifier.
+
+    Defaults to report-only. ``--apply`` is intentionally limited to the
+    sweeper helper's allow-listed safe local actions.
+    """
+    from hermes_cli import kanban_sweeper as sweeper
+
+    stale_timeout = getattr(args, "stale_timeout", None)
+    if stale_timeout is None:
+        stale_timeout = sweeper.DEFAULT_STALE_TIMEOUT_SECONDS
+    if int(stale_timeout) < 0:
+        print("kanban sweep: --stale-timeout must be >= 0", file=sys.stderr)
+        return 2
+
+    report = sweeper.build_sweep_report(
+        board=getattr(args, "board", None),
+        stale_timeout_seconds=int(stale_timeout),
+    )
+    applied: list[dict[str, Any]] = []
+    if getattr(args, "apply", False):
+        applied = sweeper.apply_safe_actions(
+            report,
+            reason=getattr(args, "reason", None),
+        )
+        # Rebuild after mutation so counts/items reflect the current board state.
+        report = sweeper.build_sweep_report(
+            board=getattr(args, "board", None),
+            stale_timeout_seconds=int(stale_timeout),
+        )
+        report["dry_run"] = False
+    else:
+        report["dry_run"] = True
+    report["applied"] = applied
+
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(sweeper.render_text(report))
     return 0
 
 

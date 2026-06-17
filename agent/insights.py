@@ -20,7 +20,7 @@ import json
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, DefaultDict, Dict, List, Optional
 
 from agent.usage_pricing import (
     CanonicalUsage,
@@ -110,7 +110,9 @@ class InsightsEngine:
         Returns:
             Dict with all computed insights
         """
-        cutoff = time.time() - (days * 86400)
+        now = time.time()
+        cutoff = now - (days * 86400)
+        previous_cutoff = now - (days * 2 * 86400)
 
         # Gather raw data
         sessions = self._get_sessions(cutoff, source)
@@ -137,6 +139,7 @@ class InsightsEngine:
                     "top_skills": [],
                 },
                 "activity": {},
+                "comparison": {"metrics": []},
                 "top_sessions": [],
             }
 
@@ -148,6 +151,10 @@ class InsightsEngine:
         skills = self._compute_skill_breakdown(skill_usage)
         activity = self._compute_activity_patterns(sessions)
         top_sessions = self._compute_top_sessions(sessions)
+        previous_sessions = self._get_sessions_between(previous_cutoff, cutoff, source)
+        previous_message_stats = self._get_message_stats_between(previous_cutoff, cutoff, source)
+        previous_overview = self._compute_overview(previous_sessions, previous_message_stats) if previous_sessions else None
+        comparison = self._compute_period_comparison(overview, previous_overview) if previous_overview else {"metrics": []}
 
         return {
             "days": days,
@@ -160,6 +167,7 @@ class InsightsEngine:
             "tools": tools,
             "skills": skills,
             "activity": activity,
+            "comparison": comparison,
             "top_sessions": top_sessions,
         }
 
@@ -187,12 +195,26 @@ class InsightsEngine:
         " ORDER BY started_at DESC"
     )
 
-    def _get_sessions(self, cutoff: float, source: str = None) -> List[Dict]:
+    def _get_sessions(self, cutoff: float, source: Optional[str] = None) -> List[Dict]:
         """Fetch sessions within the time window."""
         if source:
             cursor = self._conn.execute(self._GET_SESSIONS_WITH_SOURCE, (cutoff, source))
         else:
             cursor = self._conn.execute(self._GET_SESSIONS_ALL, (cutoff,))
+        return [dict(row) for row in cursor.fetchall()]
+
+    def _get_sessions_between(self, start: float, end: float, source: Optional[str] = None) -> List[Dict]:
+        """Fetch sessions that started inside [start, end)."""
+        if source:
+            cursor = self._conn.execute(
+                f"SELECT {self._SESSION_COLS} FROM sessions WHERE started_at >= ? AND started_at < ? AND source = ? ORDER BY started_at DESC",
+                (start, end, source),
+            )
+        else:
+            cursor = self._conn.execute(
+                f"SELECT {self._SESSION_COLS} FROM sessions WHERE started_at >= ? AND started_at < ? ORDER BY started_at DESC",
+                (start, end),
+            )
         return [dict(row) for row in cursor.fetchall()]
 
     def _get_tool_usage(self, cutoff: float, source: str = None) -> List[Dict]:
@@ -363,7 +385,7 @@ class InsightsEngine:
 
         return list(skill_counts.values())
 
-    def _get_message_stats(self, cutoff: float, source: str = None) -> Dict:
+    def _get_message_stats(self, cutoff: float, source: Optional[str] = None) -> Dict:
         """Get aggregate message statistics."""
         if source:
             cursor = self._conn.execute(
@@ -395,6 +417,38 @@ class InsightsEngine:
             "assistant_messages": 0, "tool_messages": 0,
         }
 
+    def _get_message_stats_between(self, start: float, end: float, source: Optional[str] = None) -> Dict:
+        """Get aggregate message statistics for a bounded window."""
+        if source:
+            cursor = self._conn.execute(
+                """SELECT
+                     COUNT(*) as total_messages,
+                     SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) as user_messages,
+                     SUM(CASE WHEN m.role = 'assistant' THEN 1 ELSE 0 END) as assistant_messages,
+                     SUM(CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END) as tool_messages
+                   FROM messages m
+                   JOIN sessions s ON s.id = m.session_id
+                   WHERE s.started_at >= ? AND s.started_at < ? AND s.source = ?""",
+                (start, end, source),
+            )
+        else:
+            cursor = self._conn.execute(
+                """SELECT
+                     COUNT(*) as total_messages,
+                     SUM(CASE WHEN m.role = 'user' THEN 1 ELSE 0 END) as user_messages,
+                     SUM(CASE WHEN m.role = 'assistant' THEN 1 ELSE 0 END) as assistant_messages,
+                     SUM(CASE WHEN m.role = 'tool' THEN 1 ELSE 0 END) as tool_messages
+                   FROM messages m
+                   JOIN sessions s ON s.id = m.session_id
+                   WHERE s.started_at >= ? AND s.started_at < ?""",
+                (start, end),
+            )
+        row = cursor.fetchone()
+        return dict(row) if row else {
+            "total_messages": 0, "user_messages": 0,
+            "assistant_messages": 0, "tool_messages": 0,
+        }
+
     # =========================================================================
     # Computation
     # =========================================================================
@@ -406,8 +460,17 @@ class InsightsEngine:
         total_cache_read = sum(s.get("cache_read_tokens") or 0 for s in sessions)
         total_cache_write = sum(s.get("cache_write_tokens") or 0 for s in sessions)
         total_tokens = total_input + total_output + total_cache_read + total_cache_write
+        visible_tokens = total_input + total_output
+        cache_tokens = total_cache_read + total_cache_write
         total_tool_calls = sum(s.get("tool_call_count") or 0 for s in sessions)
         total_messages = sum(s.get("message_count") or 0 for s in sessions)
+        tokens_per_message = total_tokens / total_messages if total_messages else 0
+        visible_tokens_per_message = visible_tokens / total_messages if total_messages else 0
+        total_tokens_per_session = total_tokens / len(sessions) if sessions else 0
+        visible_tokens_per_session = visible_tokens / len(sessions) if sessions else 0
+        cache_tokens_per_session = cache_tokens / len(sessions) if sessions else 0
+        tool_calls_per_session = total_tool_calls / len(sessions) if sessions else 0
+        cache_read_share = (total_cache_read / total_tokens) if total_tokens else 0
 
         # Cost estimation (weighted by model)
         total_cost = 0.0
@@ -441,11 +504,29 @@ class InsightsEngine:
 
         total_hours = sum(durations) / 3600 if durations else 0
         avg_duration = sum(durations) / len(durations) if durations else 0
+        tokens_per_active_hour = total_tokens / total_hours if total_hours else 0
+        visible_tokens_per_active_hour = visible_tokens / total_hours if total_hours else 0
+        messages_per_active_hour = total_messages / total_hours if total_hours else 0
+        sessions_per_active_hour = len(sessions) / total_hours if total_hours else 0
+        tool_calls_per_active_hour = total_tool_calls / total_hours if total_hours else 0
 
         # Earliest and latest session
         started_timestamps = [s["started_at"] for s in sessions if s.get("started_at")]
         date_range_start = min(started_timestamps) if started_timestamps else None
         date_range_end = max(started_timestamps) if started_timestamps else None
+        if date_range_start and date_range_end:
+            start_date = datetime.fromtimestamp(date_range_start).date()
+            end_date = datetime.fromtimestamp(date_range_end).date()
+            data_span_days = max(1, (end_date - start_date).days + 1)
+        else:
+            data_span_days = 0
+
+        avg_sessions_per_data_day = len(sessions) / data_span_days if data_span_days else 0
+        avg_messages_per_data_day = total_messages / data_span_days if data_span_days else 0
+        avg_tool_calls_per_data_day = total_tool_calls / data_span_days if data_span_days else 0
+        avg_visible_tokens_per_data_day = visible_tokens / data_span_days if data_span_days else 0
+        avg_cache_tokens_per_data_day = cache_tokens / data_span_days if data_span_days else 0
+        avg_total_tokens_per_data_day = total_tokens / data_span_days if data_span_days else 0
 
         return {
             "total_sessions": len(sessions),
@@ -453,24 +534,93 @@ class InsightsEngine:
             "total_tool_calls": total_tool_calls,
             "total_input_tokens": total_input,
             "total_output_tokens": total_output,
+            "total_visible_tokens": visible_tokens,
             "total_cache_read_tokens": total_cache_read,
             "total_cache_write_tokens": total_cache_write,
+            "total_cache_tokens": cache_tokens,
             "total_tokens": total_tokens,
             "estimated_cost": total_cost,
             "actual_cost": actual_cost,
             "total_hours": total_hours,
+            "sessions_per_active_hour": sessions_per_active_hour,
+            "messages_per_active_hour": messages_per_active_hour,
+            "tokens_per_active_hour": tokens_per_active_hour,
+            "visible_tokens_per_active_hour": visible_tokens_per_active_hour,
+            "tool_calls_per_active_hour": tool_calls_per_active_hour,
             "avg_session_duration": avg_duration,
             "avg_messages_per_session": total_messages / len(sessions) if sessions else 0,
-            "avg_tokens_per_session": total_tokens / len(sessions) if sessions else 0,
+            "avg_tokens_per_session": total_tokens_per_session,
+            "avg_visible_tokens_per_session": visible_tokens_per_session,
+            "avg_cache_tokens_per_session": cache_tokens_per_session,
+            "avg_tool_calls_per_session": tool_calls_per_session,
+            "tokens_per_message": tokens_per_message,
+            "visible_tokens_per_message": visible_tokens_per_message,
+            "cache_read_share": cache_read_share,
             "user_messages": message_stats.get("user_messages") or 0,
             "assistant_messages": message_stats.get("assistant_messages") or 0,
             "tool_messages": message_stats.get("tool_messages") or 0,
             "date_range_start": date_range_start,
             "date_range_end": date_range_end,
+            "data_span_days": data_span_days,
+            "avg_sessions_per_data_day": avg_sessions_per_data_day,
+            "avg_messages_per_data_day": avg_messages_per_data_day,
+            "avg_tool_calls_per_data_day": avg_tool_calls_per_data_day,
+            "avg_visible_tokens_per_data_day": avg_visible_tokens_per_data_day,
+            "avg_cache_tokens_per_data_day": avg_cache_tokens_per_data_day,
+            "avg_total_tokens_per_data_day": avg_total_tokens_per_data_day,
             "models_with_pricing": sorted(models_with_pricing),
             "models_without_pricing": sorted(models_without_pricing),
             "unknown_cost_sessions": unknown_cost_sessions,
             "included_cost_sessions": included_cost_sessions,
+        }
+
+    def _compute_period_comparison(self, current: Dict[str, Any], previous: Dict[str, Any]) -> Dict[str, Any]:
+        """Compare current vs previous period overview metrics."""
+        metrics = []
+        metric_specs = [
+            ("total_sessions", "Sessions"),
+            ("total_messages", "Messages"),
+            ("total_tool_calls", "Tool calls"),
+            ("total_input_tokens", "Input tokens"),
+            ("total_output_tokens", "Output tokens"),
+            ("total_visible_tokens", "Visible tokens"),
+            ("total_cache_read_tokens", "Cache read"),
+            ("total_cache_write_tokens", "Cache write"),
+            ("total_cache_tokens", "Cache total"),
+            ("total_tokens", "Total tokens"),
+            ("avg_sessions_per_data_day", "Sessions/day"),
+            ("avg_messages_per_data_day", "Messages/day"),
+            ("avg_tool_calls_per_data_day", "Tool calls/day"),
+            ("avg_visible_tokens_per_data_day", "Visible/day"),
+            ("avg_cache_tokens_per_data_day", "Cache/day"),
+            ("avg_total_tokens_per_data_day", "Tokens/day"),
+            ("sessions_per_active_hour", "Sessions/hr"),
+            ("messages_per_active_hour", "Messages/hr"),
+            ("tokens_per_active_hour", "Tokens/hr"),
+            ("tool_calls_per_active_hour", "Tool calls/hr"),
+            ("avg_tokens_per_session", "Tokens/session"),
+            ("avg_visible_tokens_per_session", "Visible/session"),
+            ("avg_cache_tokens_per_session", "Cache/session"),
+            ("avg_tool_calls_per_session", "Tool calls/session"),
+            ("tokens_per_message", "Tokens/message"),
+            ("visible_tokens_per_message", "Visible/message"),
+            ("cache_read_share", "Cache read share"),
+        ]
+        for key, label in metric_specs:
+            cur = current.get(key) or 0
+            prev = previous.get(key) or 0
+            delta = cur - prev
+            pct_change = None if prev == 0 else (delta / prev) * 100
+            metrics.append({
+                "key": key,
+                "label": label,
+                "current": cur,
+                "previous": prev,
+                "delta": delta,
+                "pct_change": pct_change,
+            })
+        return {
+            "metrics": metrics,
         }
 
     def _compute_model_breakdown(self, sessions: List[Dict]) -> List[Dict]:
@@ -479,6 +629,7 @@ class InsightsEngine:
             "sessions": 0, "input_tokens": 0, "output_tokens": 0,
             "cache_read_tokens": 0, "cache_write_tokens": 0,
             "total_tokens": 0, "tool_calls": 0, "cost": 0.0,
+            "visible_tokens": 0,
         })
 
         for s in sessions:
@@ -496,16 +647,27 @@ class InsightsEngine:
             d["cache_read_tokens"] += cache_read
             d["cache_write_tokens"] += cache_write
             d["total_tokens"] += inp + out + cache_read + cache_write
+            d["visible_tokens"] += inp + out
             d["tool_calls"] += s.get("tool_call_count") or 0
             estimate, status = _estimate_cost(s)
             d["cost"] += estimate
             d["has_pricing"] = has_known_pricing(model, s.get("billing_provider"), s.get("billing_base_url"))
             d["cost_status"] = status
 
-        result = [
-            {"model": model, **data}
-            for model, data in model_data.items()
-        ]
+        result = []
+        for model, data in model_data.items():
+            session_count = data["sessions"] or 1
+            result.append(
+                {
+                    "model": model,
+                    **data,
+                    "avg_visible_tokens_per_session": data["visible_tokens"] / session_count,
+                    "avg_cache_read_per_session": data["cache_read_tokens"] / session_count,
+                    "avg_cache_write_per_session": data["cache_write_tokens"] / session_count,
+                    "avg_tool_calls_per_session": data["tool_calls"] / session_count,
+                    "avg_total_tokens_per_session": data["total_tokens"] / session_count,
+                }
+            )
         # Sort by tokens first, fall back to session count when tokens are 0
         result.sort(key=lambda x: (x["total_tokens"], x["sessions"]), reverse=True)
         return result
@@ -516,6 +678,7 @@ class InsightsEngine:
             "sessions": 0, "messages": 0, "input_tokens": 0,
             "output_tokens": 0, "cache_read_tokens": 0,
             "cache_write_tokens": 0, "total_tokens": 0, "tool_calls": 0,
+            "visible_tokens": 0,
         })
 
         for s in sessions:
@@ -532,12 +695,26 @@ class InsightsEngine:
             d["cache_read_tokens"] += cache_read
             d["cache_write_tokens"] += cache_write
             d["total_tokens"] += inp + out + cache_read + cache_write
+            d["visible_tokens"] += inp + out
             d["tool_calls"] += s.get("tool_call_count") or 0
 
-        result = [
-            {"platform": platform, **data}
-            for platform, data in platform_data.items()
-        ]
+        result = []
+        for platform, data in platform_data.items():
+            session_count = data["sessions"] or 1
+            message_count = data["messages"] or 1
+            result.append(
+                {
+                    "platform": platform,
+                    **data,
+                    "avg_visible_tokens_per_session": data["visible_tokens"] / session_count,
+                    "avg_cache_read_per_session": data["cache_read_tokens"] / session_count,
+                    "avg_cache_write_per_session": data["cache_write_tokens"] / session_count,
+                    "avg_tool_calls_per_session": data["tool_calls"] / session_count,
+                    "avg_messages_per_session": data["messages"] / session_count,
+                    "avg_total_tokens_per_session": data["total_tokens"] / session_count,
+                    "avg_tokens_per_message": data["total_tokens"] / message_count,
+                }
+            )
         result.sort(key=lambda x: x["sessions"], reverse=True)
         return result
 
@@ -598,7 +775,30 @@ class InsightsEngine:
         """Analyze activity patterns by day of week and hour."""
         day_counts = Counter()  # 0=Monday ... 6=Sunday
         hour_counts = Counter()
+        hourly_token_counts = Counter()
         daily_counts = Counter()  # date string -> count
+        hour_windows: DefaultDict[float, Dict[str, Any]] = defaultdict(lambda: {
+            "window": "",
+            "sessions": 0,
+            "messages": 0,
+            "tool_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "total_tokens": 0,
+        })
+        day_windows: DefaultDict[str, Dict[str, Any]] = defaultdict(lambda: {
+            "day": "",
+            "sessions": 0,
+            "messages": 0,
+            "tool_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "total_tokens": 0,
+        })
 
         for s in sessions:
             ts = s.get("started_at")
@@ -609,6 +809,38 @@ class InsightsEngine:
             hour_counts[dt.hour] += 1
             daily_counts[dt.strftime("%Y-%m-%d")] += 1
 
+            inp = s.get("input_tokens") or 0
+            out = s.get("output_tokens") or 0
+            cache_read = s.get("cache_read_tokens") or 0
+            cache_write = s.get("cache_write_tokens") or 0
+            total_tokens = inp + out + cache_read + cache_write
+            hourly_token_counts[dt.hour] += total_tokens
+
+            bucket = dt.replace(minute=0, second=0, microsecond=0)
+            hour_key = bucket.timestamp()
+            h = hour_windows[hour_key]
+            h["window"] = bucket.strftime("%Y-%m-%d %H:00")
+            h["sessions"] += 1
+            h["messages"] += s.get("message_count") or 0
+            h["tool_calls"] += s.get("tool_call_count") or 0
+            h["input_tokens"] += inp
+            h["output_tokens"] += out
+            h["cache_read_tokens"] += cache_read
+            h["cache_write_tokens"] += cache_write
+            h["total_tokens"] += total_tokens
+
+            day_key = dt.strftime("%Y-%m-%d")
+            d = day_windows[day_key]
+            d["day"] = day_key
+            d["sessions"] += 1
+            d["messages"] += s.get("message_count") or 0
+            d["tool_calls"] += s.get("tool_call_count") or 0
+            d["input_tokens"] += inp
+            d["output_tokens"] += out
+            d["cache_read_tokens"] += cache_read
+            d["cache_write_tokens"] += cache_write
+            d["total_tokens"] += total_tokens
+
         day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         day_breakdown = [
             {"day": day_names[i], "count": day_counts.get(i, 0)}
@@ -616,9 +848,45 @@ class InsightsEngine:
         ]
 
         hour_breakdown = [
-            {"hour": i, "count": hour_counts.get(i, 0)}
+            {"hour": i, "count": hour_counts.get(i, 0), "sessions_started": hour_counts.get(i, 0)}
             for i in range(24)
         ]
+
+        peak_windows: Dict[str, Optional[Dict[str, Any]]] = {
+            "sessions": None,
+            "messages": None,
+            "tokens": None,
+            "tool_calls": None,
+        }
+        window_values = list(hour_windows.values())
+        if window_values:
+            peak_windows["sessions"] = max(window_values, key=lambda x: (x["sessions"], x["messages"], x["total_tokens"], x["window"]))
+            peak_windows["messages"] = max(window_values, key=lambda x: (x["messages"], x["sessions"], x["total_tokens"], x["window"]))
+            peak_windows["tokens"] = max(window_values, key=lambda x: (x["total_tokens"], x["sessions"], x["messages"], x["window"]))
+            peak_windows["tool_calls"] = max(window_values, key=lambda x: (x["tool_calls"], x["sessions"], x["messages"], x["window"]))
+
+        top_windows = sorted(
+            hour_windows.values(),
+            key=lambda x: (x["total_tokens"], x["sessions"], x["messages"], x["window"]),
+            reverse=True,
+        )[:5]
+        peak_days = sorted(
+            day_windows.values(),
+            key=lambda x: (x["total_tokens"], x["sessions"], x["messages"], x["day"]),
+            reverse=True,
+        )[:5]
+
+        def sparkline(values: List[int]) -> str:
+            blocks = "▁▂▃▄▅▆▇█"
+            if not values:
+                return ""
+            peak = max(values)
+            if peak <= 0:
+                return blocks[0] * len(values)
+            return "".join(blocks[min(7, int((v / peak) * 7))] for v in values)
+
+        hour_session_heatmap = sparkline([hour_counts.get(i, 0) for i in range(24)])
+        hour_token_heatmap = sparkline([hourly_token_counts.get(i, 0) for i in range(24)])
 
         # Busiest day and hour
         busiest_day = max(day_breakdown, key=lambda x: x["count"]) if day_breakdown else None
@@ -650,6 +918,11 @@ class InsightsEngine:
             "busiest_hour": busiest_hour,
             "active_days": active_days,
             "max_streak": max_streak,
+            "peak_windows": peak_windows,
+            "top_windows": top_windows,
+            "peak_days": peak_days,
+            "hour_session_heatmap": hour_session_heatmap,
+            "hour_token_heatmap": hour_token_heatmap,
         }
 
     def _compute_top_sessions(self, sessions: List[Dict]) -> List[Dict]:
@@ -684,18 +957,48 @@ class InsightsEngine:
                 "date": datetime.fromtimestamp(most_msgs["started_at"]).strftime("%b %d") if most_msgs.get("started_at") else "?",
             })
 
-        # Most tokens
-        most_tokens = max(
+        # Most visible tokens (input + output)
+        most_visible_tokens = max(
             sessions,
             key=lambda s: (s.get("input_tokens") or 0) + (s.get("output_tokens") or 0),
         )
-        token_total = (most_tokens.get("input_tokens") or 0) + (most_tokens.get("output_tokens") or 0)
-        if token_total > 0:
+        visible_total = (most_visible_tokens.get("input_tokens") or 0) + (most_visible_tokens.get("output_tokens") or 0)
+        if visible_total > 0:
             top.append({
-                "label": "Most tokens",
-                "session_id": most_tokens["id"][:16],
-                "value": f"{token_total:,} tokens",
-                "date": datetime.fromtimestamp(most_tokens["started_at"]).strftime("%b %d") if most_tokens.get("started_at") else "?",
+                "label": "Most visible tokens",
+                "session_id": most_visible_tokens["id"][:16],
+                "value": f"{visible_total:,} visible",
+                "date": datetime.fromtimestamp(most_visible_tokens["started_at"]).strftime("%b %d") if most_visible_tokens.get("started_at") else "?",
+            })
+
+        # Most total tokens (incl cache)
+        most_total = max(
+            sessions,
+            key=lambda s: (s.get("input_tokens") or 0) + (s.get("output_tokens") or 0) + (s.get("cache_read_tokens") or 0) + (s.get("cache_write_tokens") or 0),
+        )
+        total_total = (
+            (most_total.get("input_tokens") or 0)
+            + (most_total.get("output_tokens") or 0)
+            + (most_total.get("cache_read_tokens") or 0)
+            + (most_total.get("cache_write_tokens") or 0)
+        )
+        if total_total > 0:
+            top.append({
+                "label": "Most total tokens",
+                "session_id": most_total["id"][:16],
+                "value": f"{total_total:,} tokens",
+                "date": datetime.fromtimestamp(most_total["started_at"]).strftime("%b %d") if most_total.get("started_at") else "?",
+            })
+
+        # Most cache read
+        most_cache_read = max(sessions, key=lambda s: s.get("cache_read_tokens") or 0)
+        cache_read_total = most_cache_read.get("cache_read_tokens") or 0
+        if cache_read_total > 0:
+            top.append({
+                "label": "Most cache read",
+                "session_id": most_cache_read["id"][:16],
+                "value": f"{cache_read_total:,} cache",
+                "date": datetime.fromtimestamp(most_cache_read["started_at"]).strftime("%b %d") if most_cache_read.get("started_at") else "?",
             })
 
         # Most tool calls
@@ -726,11 +1029,28 @@ class InsightsEngine:
         days = report["days"]
         src_filter = report.get("source_filter")
 
+        def fmt_value(value: float | int) -> str:
+            if isinstance(value, float):
+                if value.is_integer():
+                    return f"{int(value):,}"
+                return f"{value:,.1f}"
+            return f"{value:,}"
+
+        def fmt_delta(value: float | int) -> str:
+            if isinstance(value, float):
+                if value.is_integer():
+                    return f"{value:+,.0f}"
+                return f"{value:+,.1f}"
+            return f"{value:+,}"
+
+        def fmt_pct(value: Optional[float]) -> str:
+            return "—" if value is None else f"{value:+.1f}%"
+
         # Header
         lines.append("")
         lines.append("  ╔══════════════════════════════════════════════════════════╗")
         lines.append("  ║                    📊 Hermes Insights                    ║")
-        period_label = f"Last {days} days"
+        period_label = f"Last {days} days requested"
         if src_filter:
             period_label += f" ({src_filter})"
         padding = 58 - len(period_label) - 2
@@ -745,37 +1065,78 @@ class InsightsEngine:
             start_str = datetime.fromtimestamp(o["date_range_start"]).strftime("%b %d, %Y")
             end_str = datetime.fromtimestamp(o["date_range_end"]).strftime("%b %d, %Y")
             lines.append(f"  Period: {start_str} — {end_str}")
+            if o.get("data_span_days"):
+                lines.append(f"  Data covered:      {o['data_span_days']} calendar days")
             lines.append("")
 
         # Overview
+        visible_tokens = o.get("total_visible_tokens", o["total_input_tokens"] + o["total_output_tokens"])
         lines.append("  📋 Overview")
         lines.append("  " + "─" * 56)
         lines.append(f"  Sessions:          {o['total_sessions']:<12}  Messages:        {o['total_messages']:,}")
         lines.append(f"  Tool calls:        {o['total_tool_calls']:<12,}  User messages:   {o['user_messages']:,}")
         lines.append(f"  Input tokens:      {o['total_input_tokens']:<12,}  Output tokens:   {o['total_output_tokens']:,}")
-        lines.append(f"  Total tokens:      {o['total_tokens']:,}")
+        lines.append(f"  Visible tokens:    {visible_tokens:<12,}  Cache read:      {o['total_cache_read_tokens']:,}")
+        lines.append(f"  Cache write:       {o['total_cache_write_tokens']:<12,}  Total tokens:    {o['total_tokens']:,}")
         if o["total_hours"] > 0:
             lines.append(f"  Active time:       ~{format_duration_compact(o['total_hours'] * 3600):<11}  Avg session:     ~{format_duration_compact(o['avg_session_duration'])}")
-        lines.append(f"  Avg msgs/session:  {o['avg_messages_per_session']:.1f}")
+            lines.append(f"  Rates:             Sessions/hr {o['sessions_per_active_hour']:.2f}  Messages/hr {o['messages_per_active_hour']:.2f}  Tokens/hr {o['tokens_per_active_hour']:.1f}  Tool calls/hr {o['tool_calls_per_active_hour']:.2f}")
+        lines.append(f"  Efficiency:        Tokens/message {o['tokens_per_message']:.1f}  Visible/message {o['visible_tokens_per_message']:.1f}  Visible/session {o['avg_visible_tokens_per_session']:,.1f}  Cache/session {o['avg_cache_tokens_per_session']:,.1f}  Cache read share {o['cache_read_share']:.1%}")
+        if o.get("data_span_days"):
+            lines.append(
+                f"  Daily avg:         Sessions/day {o['avg_sessions_per_data_day']:.1f}  Messages/day {o['avg_messages_per_data_day']:.1f}  Tokens/day {o['avg_total_tokens_per_data_day']:,.1f}  Tool calls/day {o['avg_tool_calls_per_data_day']:.1f}"
+            )
+        comparison = report.get("comparison", {})
+        trend_metrics = comparison.get("metrics", [])
+        lines.append("  📈 Trend vs previous 30 days")
+        lines.append("  " + "─" * 56)
+        if trend_metrics:
+            wanted = {
+                "total_sessions",
+                "total_messages",
+                "total_tool_calls",
+                "total_visible_tokens",
+                "total_cache_read_tokens",
+                "total_tokens",
+                "sessions_per_active_hour",
+                "tokens_per_active_hour",
+                "avg_tokens_per_session",
+                "cache_read_share",
+            }
+            for metric in trend_metrics:
+                if metric["key"] not in wanted:
+                    continue
+                lines.append(
+                    f"  {metric['label']:<22} {fmt_value(metric['current']):>12}  "
+                    f"Δ {fmt_delta(metric['delta']):>12}  ({fmt_pct(metric['pct_change'])})"
+                )
+        else:
+            lines.append("  No previous-period data available.")
         lines.append("")
 
         # Model breakdown
         if report["models"]:
             lines.append("  🤖 Models Used")
             lines.append("  " + "─" * 56)
-            lines.append(f"  {'Model':<30} {'Sessions':>8} {'Tokens':>12}")
+            lines.append(f"  {'Model':<30} {'Sess':>6} {'Visible':>12} {'Cache read':>12} {'Cache write':>12} {'Total':>12} {'V/S':>8} {'C/S':>8}")
             for m in report["models"]:
                 model_name = m["model"][:28]
-                lines.append(f"  {model_name:<30} {m['sessions']:>8} {m['total_tokens']:>12,}")
+                lines.append(
+                    f"  {model_name:<30} {m['sessions']:>6} {m['visible_tokens']:>12,} {m['cache_read_tokens']:>12,} {m['cache_write_tokens']:>12,} {m['total_tokens']:>12,}"
+                    f" {m['avg_visible_tokens_per_session']:>8.1f} {m['avg_cache_read_per_session']:>8.1f}"
+                )
             lines.append("")
 
         # Platform breakdown
         if len(report["platforms"]) > 1 or (report["platforms"] and report["platforms"][0]["platform"] != "cli"):
             lines.append("  📱 Platforms")
             lines.append("  " + "─" * 56)
-            lines.append(f"  {'Platform':<14} {'Sessions':>8} {'Messages':>10} {'Tokens':>14}")
+            lines.append(f"  {'Platform':<14} {'Sess':>6} {'Msgs':>8} {'Visible':>12} {'Cache read':>12} {'Cache write':>12} {'Total':>12} {'M/S':>8} {'V/S':>8}")
             for p in report["platforms"]:
-                lines.append(f"  {p['platform']:<14} {p['sessions']:>8} {p['messages']:>10,} {p['total_tokens']:>14,}")
+                lines.append(
+                    f"  {p['platform']:<14} {p['sessions']:>6} {p['messages']:>8,} {p['visible_tokens']:>12,} {p['cache_read_tokens']:>12,} {p['cache_write_tokens']:>12,} {p['total_tokens']:>12,}"
+                    f" {p['avg_messages_per_session']:>8.1f} {p['avg_visible_tokens_per_session']:>8.1f}"
+                )
             lines.append("")
 
         # Tool usage
@@ -825,6 +1186,26 @@ class InsightsEngine:
                 lines.append(f"  {d['day']}  {bar:<15} {d['count']}")
 
             lines.append("")
+            if act.get("hour_session_heatmap"):
+                lines.append(f"  Hour heat (sessions): {act['hour_session_heatmap']}")
+            if act.get("hour_token_heatmap"):
+                lines.append(f"  Hour heat (tokens):   {act['hour_token_heatmap']}")
+
+            peak_days = act.get("peak_days", [])
+            if peak_days:
+                lines.append("  Peak days (by tokens)")
+                for d in peak_days[:5]:
+                    lines.append(
+                        f"    {d['day']}  {d['total_tokens']:>14,} tokens  {d['sessions']:>4} sessions  {d['messages']:>6} msgs"
+                    )
+
+            top_windows = act.get("top_windows", [])
+            if top_windows:
+                lines.append("  Top hourly windows (by tokens)")
+                for w in top_windows[:5]:
+                    lines.append(
+                        f"    {w['window']}  {w['total_tokens']:>14,} tokens  {w['sessions']:>4} sessions  {w['messages']:>6} msgs  {w['tool_calls']:>5} tools"
+                    )
 
             # Peak hours (show top 5 busiest hours)
             busy_hours = sorted(act["by_hour"], key=lambda x: x["count"], reverse=True)
@@ -842,6 +1223,22 @@ class InsightsEngine:
                 lines.append(f"  Active days: {act['active_days']}")
             if act.get("max_streak") and act["max_streak"] > 1:
                 lines.append(f"  Best streak: {act['max_streak']} consecutive days")
+
+            peak_windows = act.get("peak_windows", {})
+            if any(peak_windows.values()):
+                lines.append("")
+                lines.append("  Hourly Peaks")
+                lines.append("  " + "─" * 56)
+                peak_rows = [
+                    ("Session starts", "sessions", "sessions"),
+                    ("Messages", "messages", "messages"),
+                    ("Tokens", "tokens", "total_tokens"),
+                    ("Tool calls", "tool_calls", "tool_calls"),
+                ]
+                for label, key, value_key in peak_rows:
+                    peak = peak_windows.get(key)
+                    if peak:
+                        lines.append(f"  {label:<16} {peak['window']:<16} {peak[value_key]:>12,}")
             lines.append("")
 
         # Notable sessions
@@ -864,13 +1261,33 @@ class InsightsEngine:
         o = report["overview"]
         days = report["days"]
 
-        lines.append(f"📊 **Hermes Insights** — Last {days} days\n")
+        lines.append(f"📊 **Hermes Insights** — Last {days} days requested\n")
 
         # Overview
         lines.append(f"**Sessions:** {o['total_sessions']} | **Messages:** {o['total_messages']:,} | **Tool calls:** {o['total_tool_calls']:,}")
-        lines.append(f"**Tokens:** {o['total_tokens']:,} (in: {o['total_input_tokens']:,} / out: {o['total_output_tokens']:,})")
+        lines.append(
+            f"**Tokens:** {o['total_tokens']:,} (visible: {o['total_visible_tokens']:,} / cache: {o['total_cache_tokens']:,}; in: {o['total_input_tokens']:,} / out: {o['total_output_tokens']:,})"
+        )
         if o["total_hours"] > 0:
-            lines.append(f"**Active time:** ~{format_duration_compact(o['total_hours'] * 3600)} | **Avg session:** ~{format_duration_compact(o['avg_session_duration'])}")
+            lines.append(
+                f"**Active:** ~{format_duration_compact(o['total_hours'] * 3600)} | **Rates:** {o['sessions_per_active_hour']:.2f} sess/hr, {o['messages_per_active_hour']:.2f} msgs/hr, {o['tokens_per_active_hour']:.1f} tok/hr, {o['tool_calls_per_active_hour']:.2f} tool/hr"
+            )
+        if o.get("data_span_days"):
+            lines.append(
+                f"**Coverage:** {o['data_span_days']} calendar days | **Daily avg:** {o['avg_sessions_per_data_day']:.1f} sess/day, {o['avg_messages_per_data_day']:.1f} msgs/day, {o['avg_total_tokens_per_data_day']:,.1f} tok/day, {o['avg_tool_calls_per_data_day']:.1f} tool/day"
+            )
+        comparison = report.get("comparison", {})
+        trend_metrics = comparison.get("metrics", [])
+        if trend_metrics:
+            trend_bits = []
+            for key in ("total_sessions", "total_tokens", "total_cache_read_tokens"):
+                metric = next((m for m in trend_metrics if m["key"] == key), None)
+                if metric:
+                    trend_bits.append(f"{metric['label']}: {metric['delta']:+,} ({metric['pct_change']:+.1f}%)" if metric.get("pct_change") is not None else f"{metric['label']}: {metric['delta']:+,}")
+            if trend_bits:
+                lines.append("**Trend:** " + " | ".join(trend_bits))
+        else:
+            lines.append("**Trend:** no previous-period data available")
         lines.append("")
 
         # Models (top 5)
@@ -917,5 +1334,14 @@ class InsightsEngine:
                 lines.append(f"**Active days:** {act['active_days']}", )
             if act.get("max_streak", 0) > 1:
                 lines.append(f"**Best streak:** {act['max_streak']} consecutive days")
+
+            peak_windows = act.get("peak_windows", {})
+            if peak_windows.get("sessions") and peak_windows.get("tokens"):
+                sess_peak = peak_windows["sessions"]
+                tok_peak = peak_windows["tokens"]
+                lines.append(
+                    f"**Hourly peaks:** sessions {sess_peak['window']} ({sess_peak['sessions']:,}), "
+                    f"tokens {tok_peak['window']} ({tok_peak['total_tokens']:,})"
+                )
 
         return "\n".join(lines)
