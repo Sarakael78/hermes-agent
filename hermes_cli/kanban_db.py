@@ -98,7 +98,7 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_INITIAL_STATUSES = {"running", "blocked", "todo"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
@@ -406,6 +406,73 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _archived_board_slug_exists(slug: str) -> bool:
+    """Return True when ``slug`` has a recoverable archive tombstone.
+
+    Archived boards are moved to ``boards/_archived/<slug>-<timestamp>``.
+    Treat either that directory prefix or the archived ``board.json``'s
+    original slug as authoritative so stale live paths cannot silently
+    recreate a board that has already been moved out of the live set.
+    """
+    normed = _normalize_board_slug(slug)
+    if not normed or normed == DEFAULT_BOARD:
+        return False
+    archive_root = boards_root() / "_archived"
+    if not archive_root.is_dir():
+        return False
+    prefix = f"{normed}-"
+    for child in archive_root.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name.startswith(prefix):
+            return True
+        meta_path = child / "board.json"
+        if not meta_path.exists():
+            continue
+        try:
+            raw = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        try:
+            archived_slug = _normalize_board_slug(raw.get("slug"))
+        except ValueError:
+            archived_slug = None
+        if archived_slug == normed:
+            return True
+    return False
+
+
+def _schema_only_board_dir(slug: str) -> bool:
+    """Return True for an empty DB-only live board directory.
+
+    This identifies ghosts created by stale ``connect(board=slug)`` calls:
+    a live directory with ``kanban.db`` but no ``board.json`` and no task/event
+    rows.  Explicitly recreated boards normally have metadata or user rows and
+    must remain visible.
+    """
+    d = board_dir(slug)
+    if not d.is_dir() or (d / "board.json").exists():
+        return False
+    db = d / "kanban.db"
+    if not db.exists():
+        return False
+    try:
+        conn = sqlite3.connect(str(db))
+        try:
+            task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            event_count = conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        return False
+    return int(task_count or 0) == 0 and int(event_count or 0) == 0
+
+
+def _is_archived_schema_only_ghost(slug: str) -> bool:
+    """Return True for a live schema-only ghost of an archived board slug."""
+    return _archived_board_slug_exists(slug) and _schema_only_board_dir(slug)
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -634,7 +701,76 @@ def create_board(
     return meta
 
 
-def list_boards(*, include_archived: bool = True) -> list[dict]:
+def _normalise_board_sort_mode(sort_mode: str | None) -> str:
+    """Return the canonical board-list sort mode.
+
+    ``default_first`` preserves the legacy order: the default board first,
+    then named boards alphabetically by slug. ``datetime_desc`` is the
+    date/time mode: ``created_at`` newest-first, with missing timestamps
+    last and display name/slug tie-breaks for deterministic output.
+    """
+    raw = (sort_mode or "default_first").strip().lower().replace("-", "_")
+    aliases = {
+        "default": "default_first",
+        "default_first": "default_first",
+        "legacy": "default_first",
+        "alpha": "alphabetical",
+        "alphabetic": "alphabetical",
+        "alphabetical": "alphabetical",
+        "name": "alphabetical",
+        "date": "datetime_desc",
+        "datetime": "datetime_desc",
+        "date_time": "datetime_desc",
+        "created_at": "datetime_desc",
+        "created_at_desc": "datetime_desc",
+        "datetime_desc": "datetime_desc",
+    }
+    try:
+        return aliases[raw]
+    except KeyError as exc:
+        raise ValueError(
+            "unknown board sort mode: "
+            f"{sort_mode!r}; expected default_first, alphabetical, or datetime_desc"
+        ) from exc
+
+
+def _board_display_sort_key(meta: dict) -> tuple[str, str]:
+    """Stable, case-insensitive display-name sort with slug tie-break."""
+    slug = str(meta.get("slug") or "")
+    name = str(meta.get("name") or slug)
+    return (name.casefold(), slug.casefold())
+
+
+def _board_datetime_desc_sort_key(meta: dict) -> tuple[int, int, str, str]:
+    """Sort boards by created_at DESC, missing timestamps last, then name/slug.
+
+    Date/time mode intentionally uses board metadata ``created_at`` because
+    boards currently do not expose updated/last-activity timestamps. Newest
+    first is the default because recent boards are usually the ones users
+    need to reach fastest in the dashboard switcher.
+    """
+    raw_created_at = meta.get("created_at")
+    if raw_created_at is None:
+        return (1, 0, *_board_display_sort_key(meta))
+    try:
+        created_at = int(raw_created_at)
+    except (TypeError, ValueError):
+        return (1, 0, *_board_display_sort_key(meta))
+    return (0, -created_at, *_board_display_sort_key(meta))
+
+
+def _sort_board_entries(entries: list[dict], sort_mode: str | None) -> list[dict]:
+    mode = _normalise_board_sort_mode(sort_mode)
+    if mode == "default_first":
+        return entries
+    if mode == "alphabetical":
+        return sorted(entries, key=_board_display_sort_key)
+    if mode == "datetime_desc":
+        return sorted(entries, key=_board_datetime_desc_sort_key)
+    raise AssertionError(f"unhandled board sort mode: {mode}")
+
+
+def list_boards(*, include_archived: bool = True, sort_mode: str | None = "default_first") -> list[dict]:
     """Enumerate all boards that exist on disk.
 
     Always includes ``default`` (even when the ``boards/default/``
@@ -642,13 +778,19 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
     Other boards are discovered by scanning ``boards/`` for subdirectories
     that either contain a ``kanban.db`` or a ``board.json``.
 
-    Returns a list of metadata dicts, sorted with ``default`` first and
-    the rest alphabetically.
+    Sort modes:
+    * ``default_first`` (also ``default``): legacy order — ``default`` first,
+      then named boards alphabetically by slug.
+    * ``alphabetical``: all boards by display name, then slug.
+    * ``datetime_desc`` (also ``datetime``): all boards by ``created_at``
+      newest-first; missing timestamps, including the synthetic default
+      board on old installs, sort last.
     """
     entries: list[dict] = []
     seen: set[str] = set()
 
-    # Default board is always first.
+    # The default board is appended first so default_first can preserve the
+    # historical order without a second sort pass.
     entries.append(read_board_metadata(DEFAULT_BOARD))
     seen.add(DEFAULT_BOARD)
 
@@ -670,12 +812,14 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
             has_meta = (child / "board.json").exists()
             if not (has_db or has_meta):
                 continue
+            if has_db and not has_meta and _is_archived_schema_only_ghost(normed):
+                continue
             meta = read_board_metadata(normed)
             if meta.get("archived") and not include_archived:
                 continue
             entries.append(meta)
             seen.add(normed)
-    return entries
+    return _sort_board_entries(entries, sort_mode)
 
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
@@ -1438,6 +1582,17 @@ def connect(
     if db_path is not None:
         path = db_path
     else:
+        slug = _normalize_board_slug(board) if board is not None else None
+        if (
+            slug
+            and slug != DEFAULT_BOARD
+            and _archived_board_slug_exists(slug)
+            and (not board_dir(slug).exists() or _schema_only_board_dir(slug))
+        ):
+            raise ValueError(
+                f"archived board slug {slug!r} cannot be implicitly re-created; "
+                "use create_board() for an intentional new live board"
+            )
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
     with _cross_process_init_lock(path):
@@ -2049,6 +2204,28 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _require_safe_scratch_workspace_path(
+    *,
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    workspace_path_was_explicit: bool,
+) -> None:
+    """Reject unsafe scratch workspace inheritance.
+
+    The unsafe scratch workspace_path case is ``workspace_kind == "scratch" and
+    workspace_path is not None`` when that path came from board.default_workdir
+    rather than the caller explicitly choosing a scratch directory.
+
+    Use workspace_kind='dir' for real project directories.
+    """
+    if workspace_kind == "scratch" and workspace_path is not None and not workspace_path_was_explicit:
+        raise ValueError(
+            "unsafe scratch workspace_path: board.default_workdir must not be "
+            "inherited by scratch tasks. Use workspace_kind='dir' for real "
+            "project directories."
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2114,6 +2291,7 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
     parents = tuple(p for p in parents if p)
+    workspace_path_was_explicit = workspace_path is not None
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2192,6 +2370,12 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    _require_safe_scratch_workspace_path(
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+        workspace_path_was_explicit=workspace_path_was_explicit,
+    )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -6675,40 +6859,6 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
-def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
-    """Return the assigned profile's effective CLI toolsets for a worker.
-
-    Dispatcher-spawned workers are launched from a long-lived gateway process,
-    then the child re-enters the CLI with ``-p <assignee>``. Resolve the
-    assignee profile's CLI tool surface at dispatch time and pass it as an
-    explicit ``--toolsets`` pin so worker startup cannot fall back to a stale
-    root/active-profile config or a profile whose top-level ``toolsets`` entry
-    is only the kanban orchestrator surface. ``model_tools`` still appends the
-    task-scoped kanban lifecycle tools when ``HERMES_KANBAN_TASK`` is set.
-    """
-    if not hermes_home:
-        return None
-    try:
-        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-        from hermes_cli.config import load_config
-        from hermes_cli.tools_config import _get_platform_tools
-
-        token = set_hermes_home_override(hermes_home)
-        try:
-            cfg = load_config()
-            toolsets = sorted(_get_platform_tools(cfg, "cli"))
-        finally:
-            reset_hermes_home_override(token)
-        return toolsets or None
-    except Exception as exc:
-        _log.debug(
-            "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
-            hermes_home,
-            exc,
-        )
-        return None
-
-
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -6842,9 +6992,6 @@ def _default_spawn(
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
         "-q", prompt,

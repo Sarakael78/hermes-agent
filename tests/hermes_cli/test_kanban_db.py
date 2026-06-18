@@ -2756,6 +2756,56 @@ def test_archive_task_triggers_recompute_ready_for_dependents(kanban_home):
             "parent is archived"
         )
 
+
+def test_connect_board_refuses_archived_slug_resurrection(kanban_home):
+    """A stale explicit connect(board=<archived slug>) must not recreate it live.
+
+    Dashboard/gateway read paths can hold a stale slug after
+    ``remove_board(..., archive=True)`` moves the board directory under
+    ``boards/_archived``.  ``connect(board=slug)`` used to mkdir the live
+    directory and initialise an empty schema-only DB, resurrecting the
+    archived board into the Active boards inventory.
+    """
+    slug = "archived-stale-connect"
+    kb.create_board(slug, name="Archived Stale Connect")
+    with kb.connect(board=slug) as conn:
+        kb.create_task(conn, title="recoverable archived work")
+
+    result = kb.remove_board(slug, archive=True)
+    archived_path = Path(result["new_path"])
+    assert archived_path.exists()
+    assert (archived_path / "kanban.db").exists()
+    assert not kb.board_dir(slug).exists()
+
+    with pytest.raises(ValueError, match="archived board slug"):
+        kb.connect(board=slug)
+
+    assert not kb.board_dir(slug).exists(), (
+        "stale connect(board=slug) must not recreate an empty live board dir"
+    )
+    assert archived_path.exists(), "archive must remain recoverable"
+
+
+def test_list_boards_hides_schema_only_ghost_for_archived_slug(kanban_home):
+    """Active board lists must skip old schema-only ghosts for tombstoned slugs."""
+    slug = "archived-schema-ghost"
+    kb.create_board(slug, name="Archived Schema Ghost")
+    result = kb.remove_board(slug, archive=True)
+    archived_path = Path(result["new_path"])
+    assert archived_path.exists()
+
+    ghost_dir = kb.board_dir(slug)
+    ghost_dir.mkdir(parents=True)
+    # Simulate the historical bug's aftermath without calling connect(board=slug),
+    # which the guard should now refuse.  Explicit db_path remains the low-level
+    # escape hatch used by tests and migrations.
+    ghost_db = ghost_dir / "kanban.db"
+    kb.init_db(db_path=ghost_db)
+
+    active_slugs = {b["slug"] for b in kb.list_boards(include_archived=False)}
+    assert slug not in active_slugs
+    assert archived_path.exists(), "hiding a ghost must not delete archived data"
+
 # ---------------------------------------------------------------------------
 # _add_column_if_missing / _migrate_add_optional_columns idempotency (#21708)
 # ---------------------------------------------------------------------------
@@ -3165,6 +3215,15 @@ def test_create_task_scratch_without_workspace_ignores_board_default_workdir(kan
     assert t is not None
     assert t.workspace_kind == "scratch"
     assert t.workspace_path is None
+
+
+def test_require_safe_scratch_workspace_path_rejects_inherited_default(kanban_home):
+    with pytest.raises(ValueError, match="unsafe scratch workspace_path"):
+        kb._require_safe_scratch_workspace_path(
+            workspace_kind="scratch",
+            workspace_path="/home/user/project",
+            workspace_path_was_explicit=False,
+        )
 
 
 def test_create_task_dir_without_workspace_inherits_board_default_workdir(kanban_home, monkeypatch):

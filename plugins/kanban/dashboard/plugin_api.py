@@ -1992,13 +1992,85 @@ class RenameBoardBody(BaseModel):
     color: Optional[str] = None
 
 
-def _board_counts(slug: str) -> dict[str, int]:
-    """Return ``{status: count}`` for a board. Safe on an empty DB."""
+class BulkArchiveBoardsBody(BaseModel):
+    slugs: list[str] = Field(default_factory=list)
+    confirm: bool = False
+    confirmation: Optional[str] = None
+
+
+def _safe_max(values: list[Optional[int]]) -> Optional[int]:
+    concrete = [int(v) for v in values if v is not None]
+    return max(concrete) if concrete else None
+
+
+def _archived_board_entries() -> list[dict[str, Any]]:
+    """Return boards moved into ``boards/_archived`` for the archive tab.
+
+    ``kanban_db.remove_board(..., archive=True)`` moves the whole board
+    directory to ``boards/_archived/<slug>-<timestamp>/``. Those boards are no
+    longer live/switchable, so the normal board scan does not expose them.
+    """
+    archive_root = kanban_db.boards_root() / "_archived"
+    if not archive_root.is_dir():
+        return []
+    entries: list[dict[str, Any]] = []
+    for child in sorted(archive_root.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_dir():
+            continue
+        has_db = (child / "kanban.db").exists()
+        has_meta = (child / "board.json").exists()
+        if not (has_db or has_meta):
+            continue
+        raw: dict[str, Any] = {}
+        if has_meta:
+            try:
+                parsed = json.loads((child / "board.json").read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    raw = parsed
+            except (OSError, json.JSONDecodeError):
+                raw = {}
+        original_slug = str(raw.get("slug") or child.name)
+        entries.append({
+            "slug": child.name,
+            "name": raw.get("name") or kanban_db._default_board_display_name(original_slug),
+            "description": raw.get("description") or original_slug,
+            "icon": raw.get("icon") or "",
+            "color": raw.get("color") or "",
+            "default_workdir": raw.get("default_workdir"),
+            "created_at": raw.get("created_at"),
+            "archived": True,
+            "original_slug": original_slug,
+            "archive_path": str(child),
+            "db_path": str(child / "kanban.db"),
+        })
+    return entries
+
+
+def _connect_board_for_overview(board: dict[str, Any] | str) -> Optional[sqlite3.Connection]:
+    """Open an overview connection for either a live board or archived board dir."""
     try:
+        if isinstance(board, dict) and board.get("archive_path"):
+            path = Path(str(board.get("db_path") or ""))
+            if not path.exists():
+                return None
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            return conn
+        slug = board["slug"] if isinstance(board, dict) else board
         path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
-            return {}
-        conn = kanban_db.connect(board=slug)
+            return None
+        return kanban_db.connect(board=slug)
+    except Exception:
+        return None
+
+
+def _board_counts(board: dict[str, Any] | str) -> dict[str, int]:
+    """Return ``{status: count}`` for a board. Safe on an empty DB."""
+    conn = _connect_board_for_overview(board)
+    if conn is None:
+        return {}
+    try:
         try:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
@@ -2010,16 +2082,151 @@ def _board_counts(slug: str) -> dict[str, int]:
         return {}
 
 
+def _board_breakdown(board: dict[str, Any] | str) -> dict[str, Any]:
+    """Compact overview signals for the boards page.
+
+    The overview deliberately uses fixture-safe reads only: status counts,
+    recent local DB activity, and latest completed run handoff where present.
+    """
+    empty = {
+        "status_counts": {},
+        "signals": {"active": 0, "running": 0, "blocked": 0, "review": 0, "ready": 0, "done": 0},
+        "recent_activity_at": None,
+        "latest_event": None,
+        "latest_completed": None,
+    }
+    try:
+        conn = _connect_board_for_overview(board)
+        if conn is None:
+            return empty
+        try:
+            counts = {
+                r["status"]: int(r["n"])
+                for r in conn.execute(
+                    "SELECT status, COUNT(*) AS n FROM tasks WHERE status != 'archived' GROUP BY status"
+                ).fetchall()
+            }
+            signals = {
+                "active": counts.get("running", 0) + counts.get("blocked", 0) + counts.get("review", 0),
+                "running": counts.get("running", 0),
+                "blocked": counts.get("blocked", 0),
+                "review": counts.get("review", 0),
+                "ready": counts.get("ready", 0),
+                "done": counts.get("done", 0),
+            }
+            task_row = conn.execute(
+                """
+                SELECT MAX(created_at) AS created_at,
+                       MAX(started_at) AS started_at,
+                       MAX(completed_at) AS completed_at,
+                       MAX(last_heartbeat_at) AS last_heartbeat_at
+                  FROM tasks
+                """
+            ).fetchone()
+            event_row = conn.execute(
+                "SELECT id, task_id, kind, created_at FROM task_events ORDER BY created_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+            run_row = conn.execute(
+                """
+                SELECT task_id, outcome, status, summary, ended_at
+                  FROM task_runs
+                 WHERE ended_at IS NOT NULL AND outcome IS NOT NULL
+                 ORDER BY ended_at DESC, id DESC
+                 LIMIT 1
+                """
+            ).fetchone()
+            run_activity = conn.execute(
+                "SELECT MAX(started_at) AS started_at, MAX(ended_at) AS ended_at, MAX(last_heartbeat_at) AS last_heartbeat_at FROM task_runs"
+            ).fetchone()
+            recent_activity_at = _safe_max([
+                task_row["created_at"] if task_row else None,
+                task_row["started_at"] if task_row else None,
+                task_row["completed_at"] if task_row else None,
+                task_row["last_heartbeat_at"] if task_row else None,
+                event_row["created_at"] if event_row else None,
+                run_activity["started_at"] if run_activity else None,
+                run_activity["ended_at"] if run_activity else None,
+                run_activity["last_heartbeat_at"] if run_activity else None,
+            ])
+            return {
+                "status_counts": counts,
+                "signals": signals,
+                "recent_activity_at": recent_activity_at,
+                "latest_event": (
+                    {
+                        "id": event_row["id"],
+                        "task_id": event_row["task_id"],
+                        "kind": event_row["kind"],
+                        "created_at": event_row["created_at"],
+                    }
+                    if event_row else None
+                ),
+                "latest_completed": (
+                    {
+                        "task_id": run_row["task_id"],
+                        "outcome": run_row["outcome"],
+                        "status": run_row["status"],
+                        "summary": run_row["summary"],
+                        "ended_at": run_row["ended_at"],
+                    }
+                    if run_row else None
+                ),
+            }
+        finally:
+            conn.close()
+    except Exception:
+        return empty
+
+
 @router.get("/boards")
-def list_boards(include_archived: bool = Query(False)):
-    """Return every board on disk with task counts and the active slug."""
-    boards = kanban_db.list_boards(include_archived=include_archived)
+def list_boards(
+    include_archived: bool = Query(False),
+    sort: str = Query(
+        "default_first",
+        description="Board list order: default_first, alphabetical, or datetime_desc",
+    ),
+):
+    """Return every board on disk with task counts, overview signals, and the active slug."""
+    try:
+        boards = kanban_db.list_boards(include_archived=include_archived, sort_mode=sort)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if include_archived:
+        boards = [*boards, *_archived_board_entries()]
     current = kanban_db.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_counts(b["slug"])
+        b["counts"] = _board_counts(b)
         b["total"] = sum(b["counts"].values())
+        b["breakdown"] = _board_breakdown(b)
     return {"boards": boards, "current": current}
+
+
+@router.post("/boards/bulk-archive")
+def bulk_archive_boards(payload: BulkArchiveBoardsBody):
+    """Archive multiple boards after an explicit confirmation gesture.
+
+    This is intentionally archive-only (no hard delete path) and refuses to do
+    anything unless the caller sends both ``confirm: true`` and the typed
+    confirmation token ``ARCHIVE``.
+    """
+    slugs = [s for s in dict.fromkeys((slug or "").strip() for slug in payload.slugs) if s]
+    if not slugs:
+        raise HTTPException(status_code=400, detail="at least one board slug is required")
+    if not payload.confirm or payload.confirmation != "ARCHIVE":
+        raise HTTPException(
+            status_code=409,
+            detail="bulk board archival requires confirm=true and confirmation='ARCHIVE'",
+        )
+    results = []
+    for slug in slugs:
+        entry: dict[str, Any] = {"slug": slug, "ok": True}
+        try:
+            entry["result"] = kanban_db.remove_board(slug, archive=True)
+        except ValueError as exc:
+            entry.update(ok=False, error=str(exc))
+        results.append(entry)
+    return {"results": results, "current": kanban_db.get_current_board()}
 
 
 @router.post("/boards")

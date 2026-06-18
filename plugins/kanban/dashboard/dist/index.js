@@ -87,25 +87,29 @@
   }
 
   // Order matches BOARD_COLUMNS in plugin_api.py.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "done"];
+  const COLUMN_ORDER = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
   const FALLBACK_COLUMN_LABEL = {
     triage: "Triage",
     todo: "Todo",
+    scheduled: "Scheduled",
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
+    review: "Review",
     done: "Done",
     archived: "Archived",
   };
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
     todo: "Waiting on dependencies or unassigned",
+    scheduled: "Delayed or waiting until a scheduled time",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
+    review: "Completed work awaiting human review",
     done: "Completed",
     archived: "Archived",
   };
@@ -154,9 +158,11 @@
   const COLUMN_DOT = {
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
+    scheduled: "hermes-kanban-dot-scheduled",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
+    review: "hermes-kanban-dot-review",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
   };
@@ -466,6 +472,9 @@
     const { t } = useI18n();
     const [board, setBoard] = useState(() => readSelectedBoard() || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
+    const [boardSort, setBoardSort] = useState(BOARD_SORT_DEFAULT);
+    const [viewMode, setViewMode] = useState("board");
+    const [selectedBoardSlugs, setSelectedBoardSlugs] = useState(() => new Set());
     const [showNewBoard, setShowNewBoard] = useState(false);
 
     const [kanbanBoard, setKanbanBoard] = useState(null);  // the grid data
@@ -542,7 +551,8 @@
 
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
-      return SDK.fetchJSON(withBoard(`${API}/boards`, board))
+      const sortMode = boardSort || BOARD_SORT_DEFAULT;
+      return SDK.fetchJSON(withBoard(`${API}/boards?sort=${encodeURIComponent(sortMode)}&include_archived=true`, board))
         .then(function (data) {
           const boards = (data && data.boards) || [];
           const storedBoard = readSelectedBoard();
@@ -560,7 +570,7 @@
           }
         })
         .catch(function () { /* non-fatal */ });
-    }, [board]);
+    }, [board, boardSort]);
 
     useEffect(function () { loadBoardList(); }, [loadBoardList]);
 
@@ -897,6 +907,10 @@
         });
     }, [selectedIds, loadBoard, board, t]);
 
+    const clearSelectedBoardSlugs = useCallback(function () {
+      setSelectedBoardSlugs(new Set());
+    }, []);
+
     // --- board switching ----------------------------------------------------
     const switchBoard = useCallback(function (nextSlug) {
       if (!nextSlug || nextSlug === board) return;
@@ -914,7 +928,9 @@
       setAssigneeFilter("");
       setIncludeArchived(false);
       clearSelected();
-    }, [board, clearSelected]);
+      clearSelectedBoardSlugs();
+      setViewMode("board");
+    }, [board, clearSelected, clearSelectedBoardSlugs]);
 
     const createNewBoard = useCallback(function (payload) {
       return SDK.fetchJSON(`${API}/boards`, {
@@ -938,6 +954,42 @@
         if (board === slug) switchBoard("default");
       });
     }, [board, loadBoardList, switchBoard]);
+
+    const toggleBoardSlug = useCallback(function (slug) {
+      if (!slug || slug === "default") return;
+      setSelectedBoardSlugs(function (prev) {
+        const next = new Set(prev);
+        if (next.has(slug)) next.delete(slug);
+        else next.add(slug);
+        return next;
+      });
+    }, []);
+
+    const archiveSelectedBoards = useCallback(function () {
+      const slugs = Array.from(selectedBoardSlugs).filter(function (slug) { return slug && slug !== "default"; });
+      if (slugs.length === 0) return Promise.resolve();
+      const typed = window.prompt(
+        `Archive ${slugs.length} selected board(s)? Type ARCHIVE to confirm. Boards are moved to _archived, not deleted.`,
+        "",
+      );
+      if (typed !== "ARCHIVE") return Promise.resolve();
+      return SDK.fetchJSON(`${API}/boards/bulk-archive`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slugs: slugs, confirm: true, confirmation: "ARCHIVE" }),
+      }).then(function (res) {
+        const failed = (res.results || []).filter(function (r) { return !r.ok; });
+        if (failed.length > 0) {
+          setError(`Board archive: ${failed.length} failed: ` +
+            failed.slice(0, 3).map(function (f) { return `${f.slug} (${f.error})`; }).join("; "));
+        } else {
+          setError(null);
+        }
+        clearSelectedBoardSlugs();
+        loadBoardList();
+        if (slugs.indexOf(board) !== -1) switchBoard("default");
+      }).catch(function (e) { setError(String(e.message || e)); });
+    }, [selectedBoardSlugs, board, clearSelectedBoardSlugs, loadBoardList, switchBoard]);
 
    const deleteTask = useCallback(function (taskId) {
      if (!window.confirm(tx(t, "trash.confirm", FALLBACK_TRASH.confirm))) return Promise.resolve();
@@ -990,7 +1042,11 @@
         h(BoardSwitcher, {
           board: board,
           boardList: boardList,
+          sortMode: boardSort,
+          viewMode: viewMode,
+          onSortChange: setBoardSort,
           onSwitch: switchBoard,
+          onOverviewClick: function () { setViewMode(viewMode === "boards" ? "board" : "boards"); },
           onNewClick: function () { setShowNewBoard(true); },
           onDeleteBoard: deleteBoard,
         }),
@@ -1000,12 +1056,22 @@
             return createNewBoard(payload).then(function () { setShowNewBoard(false); });
           },
         }) : null,
-        h(OrchestrationPanel, null),
-        h(AttentionStrip, {
+        viewMode === "boards" ? h(BoardsOverview, {
+          boards: boardList,
+          sortMode: boardSort,
+          current: board,
+          selectedBoardSlugs: selectedBoardSlugs,
+          onToggle: toggleBoardSlug,
+          onSwitch: switchBoard,
+          onArchiveSelected: archiveSelectedBoards,
+          onClearSelected: clearSelectedBoardSlugs,
+        }) : null,
+        viewMode === "board" ? h(OrchestrationPanel, null) : null,
+        viewMode === "board" ? h(AttentionStrip, {
           boardData,
           onOpen: setSelectedTaskId,
-        }),
-        h(BoardToolbar, {
+        }) : null,
+        viewMode === "board" ? h(BoardToolbar, {
           board: boardData,
           tenantFilter, setTenantFilter,
           assigneeFilter, setAssigneeFilter,
@@ -1018,8 +1084,8 @@
               .catch(function (e) { setError(String(e.message || e)); });
           },
           onRefresh: loadBoard,
-        }),
-       selectedIds.size > 0 ? h(BulkActionBar, {
+        }) : null,
+       viewMode === "board" && selectedIds.size > 0 ? h(BulkActionBar, {
          count: selectedIds.size,
          assignees: (boardData && boardData.assignees) || [],
          onApply: applyBulk,
@@ -1028,7 +1094,7 @@
          onDelete: deleteSelected,
        }) : null,
         error ? h("div", { className: "text-xs text-destructive px-2" }, error) : null,
-        h(BoardColumns, {
+        viewMode === "board" ? h(BoardColumns, {
           board: filteredBoard,
           laneByProfile,
           selectedIds,
@@ -1045,8 +1111,8 @@
           onOpen: setSelectedTaskId,
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
-        }),
-        selectedTaskId ? h(TaskDrawer, {
+        }) : null,
+        viewMode === "board" && selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
           boardSlug: board,
           onClose: function () { setSelectedTaskId(null); },
@@ -1716,6 +1782,15 @@
     );
   }
 
+  function profileModelProviderLabel(profile) {
+    const model = String((profile && profile.model) || "").trim();
+    const provider = String((profile && profile.provider) || "").trim();
+    if (provider && model) return provider + " / " + model;
+    if (provider) return provider + " / unknown model";
+    if (model) return model;
+    return "Unknown model/provider";
+  }
+
   function ProfileDescriptionRow(props) {
     const p = props.profile;
     const [draft, setDraft] = useState(p.description || "");
@@ -1739,6 +1814,10 @@
           ? h("span", { className: "text-[10px] text-yellow-600" }, "⚠ no description")
           : null,
       ),
+      h("div", {
+        className: "hermes-kanban-profile-model text-[10px] text-muted-foreground",
+        title: "Configured provider/model from this profile's local config.yaml. Task-level model overrides may differ.",
+      }, "Model: " + profileModelProviderLabel(p)),
       h("div", { className: "flex items-center gap-2" },
         h(Input, {
           value: draft,
@@ -1762,9 +1841,62 @@
     );
   }
 
+  const BOARD_SORT_DEFAULT = "default_first";
+  const BOARD_SORT_OPTIONS = [
+    { value: "default_first", label: "Default first" },
+    { value: "alphabetical", label: "Alphabetical" },
+    { value: "datetime_desc", label: "Date/time (newest first)" },
+  ];
+
+  function boardSlugKey(board) {
+    return String((board && board.slug) || "").toLowerCase();
+  }
+
+  function boardNameKey(board) {
+    return String((board && (board.name || board.slug)) || "").toLowerCase();
+  }
+
+  function boardCreatedAt(board) {
+    const raw = board && board.created_at;
+    if (raw === null || raw === undefined || raw === "") return -Infinity;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : -Infinity;
+  }
+
+  function compareBoardSlugs(a, b) {
+    const aSlug = boardSlugKey(a);
+    const bSlug = boardSlugKey(b);
+    return aSlug.localeCompare(bSlug) || boardNameKey(a).localeCompare(boardNameKey(b));
+  }
+
+  function compareBoardNames(a, b) {
+    return boardNameKey(a).localeCompare(boardNameKey(b)) || compareBoardSlugs(a, b);
+  }
+
+  function sortBoardList(list, mode) {
+    const boards = (list || []).slice();
+    if (mode === "alphabetical") {
+      return boards.sort(compareBoardNames);
+    }
+    if (mode === "datetime_desc") {
+      return boards.sort(function (a, b) {
+        const byDate = boardCreatedAt(b) - boardCreatedAt(a);
+        return byDate || compareBoardNames(a, b);
+      });
+    }
+    return boards.sort(function (a, b) {
+      if (a.slug === "default" && b.slug !== "default") return -1;
+      if (b.slug === "default" && a.slug !== "default") return 1;
+      return compareBoardSlugs(a, b);
+    });
+  }
+
   function BoardSwitcher(props) {
     const { t } = useI18n();
-    const list = props.boardList || [];
+    const list = (props.boardList || []).filter(function (b) { return !b.archived; });
+    const sortedList = useMemo(function () {
+      return sortBoardList(list, props.sortMode || BOARD_SORT_DEFAULT);
+    }, [list, props.sortMode]);
     const current = list.find(function (b) { return b.slug === props.board; });
     const currentName = current && current.name ? current.name : props.board;
     const currentTotal = current ? current.total : 0;
@@ -1803,7 +1935,7 @@
               "aria-label": "Switch kanban board",
               title: "Boards are independent work streams. Each board has its own tasks, tenants, and assignees.",
             }, selectChangeHandler(function (v) { if (v) props.onSwitch(v); })),
-              list.map(function (b) {
+              sortedList.map(function (b) {
                 const label = b.total > 0
                   ? `${b.name || b.slug} · ${b.total}`
                   : (b.name || b.slug);
@@ -1812,10 +1944,31 @@
             ),
             h("span", { className: "text-xs text-muted-foreground" },
               `${currentTotal || 0} task${currentTotal === 1 ? "" : "s"}`),
+            h("span", { className: "text-xs text-muted-foreground" },
+              tx(t, "boardSort", "Sort")),
+            h(Select, Object.assign({
+              value: props.sortMode || BOARD_SORT_DEFAULT,
+              className: "h-8 min-w-[170px]",
+              "aria-label": "Sort boards",
+              title: "Choose how the board list is ordered.",
+            }, selectChangeHandler(function (v) {
+              if (props.onSortChange) props.onSortChange(v || BOARD_SORT_DEFAULT);
+            })),
+              BOARD_SORT_OPTIONS.map(function (option) {
+                return h(SelectOption, { key: option.value, value: option.value }, option.label);
+              }),
+            ),
           ),
         ),
         h("div", { className: "flex-1" }),
         h(DocsLink, null),
+        h(Button, {
+          onClick: props.onOverviewClick,
+          size: "sm",
+          variant: props.viewMode === "boards" ? "default" : "outline",
+          className: "h-8",
+          title: "Show every non-archived board with status counts, activity, and bulk archive controls.",
+        }, props.viewMode === "boards" ? "Current board" : "Boards overview"),
         h(Button, {
           onClick: props.onNewClick,
           size: "sm",
@@ -1835,6 +1988,134 @@
             title: tx(t, "archiveBoardTitle", "Archive this board"),
           }, tx(t, "archive", "Archive"))
           : null,
+      ),
+    );
+  }
+
+  const BOARD_OVERVIEW_TABS = [
+    { key: "active", label: "Active boards" },
+    { key: "completed", label: "Recently completed" },
+    { key: "archived", label: "Archived boards" },
+  ];
+
+  function boardOpenWorkCount(board) {
+    const counts = board.counts || {};
+    let n = 0;
+    Object.keys(counts).forEach(function (k) {
+      if (k !== "done" && k !== "archived") n += counts[k] || 0;
+    });
+    return n;
+  }
+
+  function boardOverviewTabKey(board) {
+    if (board.archived) return "archived";
+    if (boardOpenWorkCount(board) === 0 && (board.total || 0) > 0) return "completed";
+    return "active";
+  }
+
+  function BoardsOverview(props) {
+    const boards = props.boards || [];
+    const [tab, setTab] = useState("active");
+    const sortedBoards = useMemo(function () {
+      return sortBoardList(boards, props.sortMode || BOARD_SORT_DEFAULT);
+    }, [boards, props.sortMode]);
+    const tabCounts = useMemo(function () {
+      return sortedBoards.reduce(function (acc, b) {
+        const key = boardOverviewTabKey(b);
+        acc[key] = (acc[key] || 0) + 1;
+        return acc;
+      }, { active: 0, completed: 0, archived: 0 });
+    }, [sortedBoards]);
+    const visibleBoards = sortedBoards.filter(function (b) { return boardOverviewTabKey(b) === tab; });
+    const selectedBoardSlugs = props.selectedBoardSlugs || new Set();
+    const selectedCount = selectedBoardSlugs.size || 0;
+    const archiveableBoards = visibleBoards.filter(function (b) { return b.slug !== "default" && !b.archived; });
+    const allArchiveableSelected = archiveableBoards.length > 0 && archiveableBoards.every(function (b) {
+      return selectedBoardSlugs.has(b.slug);
+    });
+    const toggleAll = function () {
+      if (allArchiveableSelected) {
+        props.onClearSelected();
+        return;
+      }
+      for (const b of archiveableBoards) {
+        if (!selectedBoardSlugs.has(b.slug)) props.onToggle(b.slug);
+      }
+    };
+    return h(Card, { className: "hermes-kanban-board-overview" },
+      h(CardContent, { className: "p-4 flex flex-col gap-3" },
+        h("div", { className: "flex items-center justify-between gap-3" },
+          h("div", null,
+            h("div", { className: "text-sm font-semibold" }, "Boards overview"),
+            h("div", { className: "text-xs text-muted-foreground" },
+              "Boards are grouped by live work, completed-but-not-archived work, and recoverable archived board snapshots."),
+          ),
+          h("div", { className: "flex items-center gap-2" },
+            h(Button, { size: "sm", variant: "outline", onClick: toggleAll, disabled: archiveableBoards.length === 0 },
+              allArchiveableSelected ? "Clear board selection" : "Select archiveable"),
+            h(Button, {
+              size: "sm",
+              variant: "destructive",
+              disabled: selectedCount === 0,
+              onClick: props.onArchiveSelected,
+              title: "Requires typing ARCHIVE; archives only, never hard-deletes.",
+            }, `Archive selected (${selectedCount})`),
+          ),
+        ),
+        h("div", { className: "hermes-kanban-board-overview-tabs" },
+          BOARD_OVERVIEW_TABS.map(function (item) {
+            return h(Button, {
+              key: item.key,
+              size: "sm",
+              variant: tab === item.key ? "default" : "outline",
+              onClick: function () { setTab(item.key); props.onClearSelected(); },
+              className: "h-8",
+            }, `${item.label} (${tabCounts[item.key] || 0})`);
+          }),
+        ),
+        h("div", { className: "hermes-kanban-board-overview-list" },
+          visibleBoards.length === 0 ? h("div", { className: "text-xs text-muted-foreground px-2 py-3" },
+            "No boards in this tab.") : visibleBoards.map(function (b) {
+            const breakdown = b.breakdown || {};
+            const signals = breakdown.signals || {};
+            const latest = breakdown.latest_completed || null;
+            const activity = breakdown.recent_activity_at ? timeAgo(breakdown.recent_activity_at) : "No activity yet";
+            const isDefault = b.slug === "default";
+            const isArchivedBoard = !!b.archived;
+            const checked = selectedBoardSlugs.has(b.slug);
+            return h("div", { key: b.slug, className: "hermes-kanban-board-overview-row" },
+              h("label", { className: "hermes-kanban-board-overview-select" },
+                h(Checkbox, {
+                  checked: checked,
+                  disabled: isDefault || isArchivedBoard,
+                  onCheckedChange: function () { if (!isArchivedBoard) props.onToggle(b.slug); },
+                  title: isArchivedBoard ? "Archived board snapshots are read-only here" : (isDefault ? "Default board cannot be archived" : "Select this board for bulk archive"),
+                }),
+              ),
+              h("div", { className: "hermes-kanban-board-overview-main" },
+                h("button", {
+                  type: "button",
+                  className: "hermes-kanban-board-overview-title",
+                  disabled: isArchivedBoard,
+                  onClick: function () { if (!isArchivedBoard) props.onSwitch(b.slug); },
+                  title: isArchivedBoard ? "Archived board snapshots are read-only and cannot be opened as live boards" : "Open this board",
+                }, `${b.name || b.slug}${b.slug === props.current ? " · current" : ""}`),
+                h("div", { className: "text-xs text-muted-foreground" },
+                  isArchivedBoard && b.original_slug ? `Archived snapshot of ${b.original_slug}` : (b.description || b.slug)),
+                latest ? h("div", { className: "text-xs text-muted-foreground" },
+                  `Last completed: ${latest.outcome || latest.status || "done"}${latest.summary ? " — " + latest.summary : ""}`) : null,
+              ),
+              h("div", { className: "hermes-kanban-board-overview-counts" },
+                h(Badge, { variant: "secondary" }, `total ${b.total || 0}`),
+                h(Badge, { variant: signals.running ? "default" : "secondary" }, `running ${signals.running || 0}`),
+                h(Badge, { variant: signals.blocked ? "destructive" : "secondary" }, `blocked ${signals.blocked || 0}`),
+                h(Badge, { variant: signals.review ? "default" : "secondary" }, `review ${signals.review || 0}`),
+                h(Badge, { variant: signals.done ? "secondary" : "outline" }, `done ${signals.done || 0}`),
+                h("span", { className: "text-xs text-muted-foreground" }, activity),
+              ),
+            );
+          }),
+        ),
       ),
     );
   }
@@ -2240,7 +2521,10 @@
     const handleDragEnd = useCallback(function () {
       if (props.onDragEnd) props.onDragEnd();
     }, [props.onDragEnd]);
-    return h("div", { className: "hermes-kanban-columns", onDragStart: handleDragStart, onDragEnd: handleDragEnd },
+    const columnStyle = useMemo(function () {
+      return { "--kanban-column-count": String(props.board.columns.length || 1) };
+    }, [props.board.columns.length]);
+    return h("div", { className: "hermes-kanban-columns", style: columnStyle, onDragStart: handleDragStart, onDragEnd: handleDragEnd },
       props.board.columns.map(function (col) {
         return h(Column, {
           key: col.name,
