@@ -531,6 +531,46 @@
         .catch(function () { setConfig({ render_markdown: true }); });
     }, []);  // eslint-disable-line react-hooks/exhaustive-deps
 
+    // --- load list of boards for the switcher ------------------------------
+    const loadBoardList = useCallback(function (opts) {
+      opts = opts || {};
+      const sortMode = boardSort || BOARD_SORT_DEFAULT;
+      const qs = new URLSearchParams();
+      qs.set("sort", sortMode);
+      if (opts.includeArchived) qs.set("include_archived", "true");
+      const enrich = opts.enrich || (opts.includeArchived ? "full" : "light");
+      qs.set("enrich", enrich);
+      return SDK.fetchJSON(withBoard(`${API}/boards?${qs}`, board))
+        .then(function (data) {
+          const boards = (data && data.boards) || [];
+          const storedBoard = readSelectedBoard();
+          setBoardList(boards);
+          if (!storedBoard && !board && data && data.current) {
+            setBoard(data.current);
+            return;
+          }
+          if (storedBoard && !boards.find(function (b) { return b.slug === storedBoard; })) {
+            writeSelectedBoard("");
+            setBoard((data && data.current) || "default");
+            setError(null);
+            return;
+          }
+          if (board && board !== "default" && !boards.find(function (b) { return b.slug === board; })) {
+            setBoard((data && data.current) || "default");
+            writeSelectedBoard((data && data.current) || "default");
+          }
+        })
+        .catch(function () { /* non-fatal */ });
+    }, [board, boardSort]);
+
+    const handleOverviewTabChange = useCallback(function (tabKey) {
+      if (tabKey === "archived") {
+        loadBoardList({ includeArchived: true, enrich: "full" });
+      } else {
+        loadBoardList({ includeArchived: false, enrich: "light" });
+      }
+    }, [loadBoardList]);
+
     // --- fetch full board ---------------------------------------------------
     const loadBoard = useCallback(() => {
       const qs = new URLSearchParams();
@@ -544,33 +584,18 @@
           setError(null);
         })
         .catch(function (err) {
-          setError(String(err && err.message ? err.message : err));
-        })
-        .finally(function () { setLoading(false); });
-    }, [tenantFilter, includeArchived, board]);
-
-    // --- load list of boards for the switcher ------------------------------
-    const loadBoardList = useCallback(function () {
-      const sortMode = boardSort || BOARD_SORT_DEFAULT;
-      return SDK.fetchJSON(withBoard(`${API}/boards?sort=${encodeURIComponent(sortMode)}&include_archived=true`, board))
-        .then(function (data) {
-          const boards = (data && data.boards) || [];
-          const storedBoard = readSelectedBoard();
-          setBoardList(boards);
-          if (!storedBoard && !board && data && data.current) {
-            setBoard(data.current);
+          const msg = String(err && err.message ? err.message : err);
+          if (/archived board slug|404|not found/i.test(msg)) {
+            writeSelectedBoard("");
+            setBoard(null);
+            setError(null);
+            loadBoardList({ includeArchived: false, enrich: "light" });
             return;
           }
-          // If the stored slug isn't in the list any longer (board was
-          // deleted in the CLI while dashboard was open), fall back to
-          // default so the UI doesn't hang on a 404.
-          if (board && board !== "default" && !boards.find(function (b) { return b.slug === board; })) {
-            setBoard("default");
-            writeSelectedBoard("default");
-          }
+          setError(msg);
         })
-        .catch(function () { /* non-fatal */ });
-    }, [board, boardSort]);
+        .finally(function () { setLoading(false); });
+    }, [tenantFilter, includeArchived, board, loadBoardList]);
 
     useEffect(function () { loadBoardList(); }, [loadBoardList]);
 
@@ -1065,6 +1090,7 @@
           onSwitch: switchBoard,
           onArchiveSelected: archiveSelectedBoards,
           onClearSelected: clearSelectedBoardSlugs,
+          onOverviewTabChange: handleOverviewTabChange,
         }) : null,
         viewMode === "board" ? h(OrchestrationPanel, null) : null,
         viewMode === "board" ? h(AttentionStrip, {
@@ -2068,7 +2094,7 @@
               key: item.key,
               size: "sm",
               variant: tab === item.key ? "default" : "outline",
-              onClick: function () { setTab(item.key); props.onClearSelected(); },
+              onClick: function () { setTab(item.key); props.onClearSelected(); props.onOverviewTabChange && props.onOverviewTabChange(item.key); },
               className: "h-8",
             }, `${item.label} (${tabCounts[item.key] || 0})`);
           }),

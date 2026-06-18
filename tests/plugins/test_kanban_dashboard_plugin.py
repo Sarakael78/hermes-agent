@@ -307,7 +307,8 @@ def test_dashboard_board_switcher_sort_options_reorder_board_list():
     assert "Default first" in js
     assert "Alphabetical" in js
     assert "Date/time" in js
-    assert "boards?sort=${encodeURIComponent(sortMode)}" in js
+    assert 'qs.set("sort", sortMode)' in js
+    assert 'qs.set("enrich", enrich)' in js
     assert "}, [board, boardSort]);" in js
     assert "sortBoardList(list, props.sortMode || BOARD_SORT_DEFAULT)" in js
     assert "sortBoardList(boards, props.sortMode || BOARD_SORT_DEFAULT)" in js
@@ -418,6 +419,37 @@ def test_boards_endpoint_hides_archived_schema_only_ghost_from_active_tab(client
         b.get("archived") and b.get("original_slug") == slug
         for b in boards
     )
+
+
+def test_boards_enrich_light_omits_breakdown(client):
+    r = client.get("/api/plugins/kanban/boards?enrich=light")
+    assert r.status_code == 200, r.text
+    boards = r.json()["boards"]
+    assert boards
+    assert all(b.get("breakdown") is None for b in boards)
+
+
+def test_boards_enrich_full_includes_breakdown(client):
+    r = client.get("/api/plugins/kanban/boards?enrich=full")
+    assert r.status_code == 200, r.text
+    boards = r.json()["boards"]
+    assert boards
+    assert all(isinstance(b.get("breakdown"), dict) for b in boards)
+
+
+def test_get_board_archived_ghost_slug_returns_404(client, tmp_path, monkeypatch):
+    import hermes_cli.kanban_db as kb
+
+    slug = "perf-test-archived-ghost"
+    kb.create_board(slug, name="Perf ghost")
+    kb.remove_board(slug, archive=True)
+    ghost_dir = kb.board_dir(slug)
+    ghost_dir.mkdir(parents=True, exist_ok=True)
+    kb.init_db(db_path=ghost_dir / "kanban.db")
+
+    r = client.get(f"/api/plugins/kanban/board?board={slug}")
+    assert r.status_code == 404, r.text
+    assert "archived board slug" in r.json().get("detail", "").lower()
 
 
 # ---------------------------------------------------------------------------
@@ -2355,7 +2387,7 @@ def test_boards_overview_excludes_archived_and_adds_breakdown(client):
     finally:
         conn.close()
 
-    r = client.get("/api/plugins/kanban/boards")
+    r = client.get("/api/plugins/kanban/boards?enrich=full")
     assert r.status_code == 200, r.text
     data = r.json()
     slugs = [b["slug"] for b in data["boards"]]
@@ -2430,7 +2462,7 @@ def test_dashboard_boards_overview_bulk_archive_ui_tokens():
     assert "Recently completed" in js
     assert "Archived boards" in js
     assert "boardOverviewTabKey" in js
-    assert "include_archived=true" in js
+    assert 'qs.set("include_archived", "true")' in js
     assert "selectedBoardSlugs" in js
     assert "boards/bulk-archive" in js
     assert "confirmation: \"ARCHIVE\"" in js
@@ -2475,8 +2507,8 @@ def test_dashboard_requests_default_board_explicitly():
     dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
 
     assert "SDK.fetchJSON(withBoard(`${API}/config`, board))" in dist
-    assert "SDK.fetchJSON(withBoard(`${API}/boards?sort=${encodeURIComponent(sortMode)}&include_archived=true`, board))" in dist
-    assert "}, [loadBoardList, switchBoard, board]);" in dist
+    assert "SDK.fetchJSON(withBoard(`${API}/boards?${qs}`, board))" in dist
+    assert "onOverviewTabChange: handleOverviewTabChange" in dist
 
 
 def test_dashboard_search_includes_body_and_result():

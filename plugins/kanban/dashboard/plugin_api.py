@@ -397,7 +397,10 @@ def get_board(
     ``current`` pointer → ``default``).
     """
     board = _resolve_board(board)
-    conn = _conn(board=board)
+    try:
+        conn = _conn(board=board)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
     try:
         tasks = kanban_db.list_tasks(
             conn,
@@ -2185,8 +2188,15 @@ def list_boards(
         "default_first",
         description="Board list order: default_first, alphabetical, or datetime_desc",
     ),
+    enrich: str = Query(
+        "light",
+        description="light = counts only (fast); full = per-board breakdown signals",
+    ),
 ):
     """Return every board on disk with task counts, overview signals, and the active slug."""
+    enrich_mode = (enrich or "light").strip().lower()
+    if enrich_mode not in ("light", "full"):
+        raise HTTPException(status_code=400, detail=f"invalid enrich mode: {enrich!r}")
     try:
         boards = kanban_db.list_boards(include_archived=include_archived, sort_mode=sort)
     except ValueError as exc:
@@ -2198,7 +2208,10 @@ def list_boards(
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_counts(b)
         b["total"] = sum(b["counts"].values())
-        b["breakdown"] = _board_breakdown(b)
+        if enrich_mode == "full":
+            b["breakdown"] = _board_breakdown(b)
+        else:
+            b["breakdown"] = None
     return {"boards": boards, "current": current}
 
 
