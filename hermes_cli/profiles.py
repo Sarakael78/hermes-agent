@@ -499,35 +499,70 @@ def find_alias_for_profile(profile_name: str) -> Optional[str]:
     so ``profile list``/``show`` surface the command the user actually typed.
     Results are sorted for deterministic output when several aliases match.
     """
-    wrapper_dir = _get_wrapper_dir()
-    if not wrapper_dir.is_dir():
-        return None
     canon = normalize_profile_name(profile_name)
-    is_windows = sys.platform == "win32"
-    needle = f"hermes -p {canon}"
+    return _profile_alias_map().get(canon)
 
-    custom: Optional[str] = None
-    profile_named: Optional[str] = None
-    for entry in sorted(wrapper_dir.iterdir()):
-        if not entry.is_file():
-            continue
-        # Only our own wrappers are named with the alias and (on Windows) .bat.
-        if is_windows and entry.suffix != ".bat":
-            continue
-        if not is_windows and entry.suffix:
-            continue
+
+_ALIAS_MAP_CACHE: Optional[tuple[float, dict[str, str]]] = None
+
+
+def _profile_alias_map() -> dict[str, str]:
+    """Scan wrapper scripts once and map profile name → preferred alias name."""
+    global _ALIAS_MAP_CACHE
+    wrapper_dir = _get_wrapper_dir()
+    mtime = 0.0
+    if wrapper_dir.is_dir():
         try:
-            content = entry.read_text()
-        except (OSError, UnicodeDecodeError):
-            continue
-        if needle not in content:
-            continue
-        alias = entry.stem if is_windows else entry.name
-        if alias == canon:
-            profile_named = alias
-        elif custom is None:
-            custom = alias
-    return custom if custom is not None else profile_named
+            mtime = wrapper_dir.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+    if _ALIAS_MAP_CACHE is not None and _ALIAS_MAP_CACHE[0] == mtime:
+        return _ALIAS_MAP_CACHE[1]
+
+    is_windows = sys.platform == "win32"
+    custom: dict[str, str] = {}
+    profile_named: dict[str, str] = {}
+    if wrapper_dir.is_dir():
+        for entry in sorted(wrapper_dir.iterdir()):
+            if not entry.is_file():
+                continue
+            if is_windows and entry.suffix != ".bat":
+                continue
+            if not is_windows and entry.suffix:
+                continue
+            try:
+                content = entry.read_text()
+            except (OSError, UnicodeDecodeError):
+                continue
+            alias = entry.stem if is_windows else entry.name
+            for line in content.splitlines():
+                if "hermes -p " not in line:
+                    continue
+                idx = line.find("hermes -p ")
+                rest = line[idx + len("hermes -p ") :].strip()
+                if not rest:
+                    continue
+                prof = rest.split()[0].strip("\"'")
+                if not prof:
+                    continue
+                canon = normalize_profile_name(prof)
+                if alias == canon:
+                    profile_named.setdefault(canon, alias)
+                else:
+                    custom.setdefault(canon, alias)
+                break
+
+    merged: dict[str, str] = {}
+    for canon in set(custom) | set(profile_named):
+        merged[canon] = custom.get(canon) or profile_named[canon]
+    _ALIAS_MAP_CACHE = (mtime, merged)
+    return merged
+
+
+def invalidate_profile_alias_cache() -> None:
+    """Drop cached wrapper→profile map (tests / after alias create)."""
+    global _ALIAS_MAP_CACHE
+    _ALIAS_MAP_CACHE = None
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +812,69 @@ def list_profiles() -> List[ProfileInfo]:
                 description=meta.get("description", ""),
                 description_auto=meta.get("description_auto", False),
             ))
+
+    return profiles
+
+
+def list_profiles_for_roster() -> List[ProfileInfo]:
+    """Fast profile list for dashboard pickers (Kanban orchestration UI).
+
+    Skips per-profile gateway PID probes and wrapper path resolution — those
+    are expensive at 50+ profiles and are not shown in the Kanban roster panel.
+    """
+    profiles: List[ProfileInfo] = []
+
+    default_home = _get_default_hermes_home()
+    if default_home.is_dir():
+        model, provider = _read_config_model(default_home)
+        dist_name, dist_version, dist_source = _read_distribution_meta(default_home)
+        meta = read_profile_meta(default_home)
+        profiles.append(
+            ProfileInfo(
+                name="default",
+                path=default_home,
+                is_default=True,
+                gateway_running=False,
+                model=model,
+                provider=provider,
+                has_env=(default_home / ".env").exists(),
+                skill_count=_count_skills(default_home),
+                distribution_name=dist_name,
+                distribution_version=dist_version,
+                distribution_source=dist_source,
+                description=meta.get("description", ""),
+                description_auto=meta.get("description_auto", False),
+            )
+        )
+
+    profiles_root = _get_profiles_root()
+    if profiles_root.is_dir():
+        for entry in sorted(profiles_root.iterdir()):
+            if not entry.is_dir():
+                continue
+            name = entry.name
+            if name == "default" or not _PROFILE_ID_RE.match(name):
+                continue
+            model, provider = _read_config_model(entry)
+            dist_name, dist_version, dist_source = _read_distribution_meta(entry)
+            meta = read_profile_meta(entry)
+            profiles.append(
+                ProfileInfo(
+                    name=name,
+                    path=entry,
+                    is_default=False,
+                    gateway_running=False,
+                    model=model,
+                    provider=provider,
+                    has_env=(entry / ".env").exists(),
+                    skill_count=_count_skills(entry),
+                    distribution_name=dist_name,
+                    distribution_version=dist_version,
+                    distribution_source=dist_source,
+                    description=meta.get("description", ""),
+                    description_auto=meta.get("description_auto", False),
+                )
+            )
 
     return profiles
 

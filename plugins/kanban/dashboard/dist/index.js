@@ -1587,24 +1587,36 @@
     const [busy, setBusy] = useState({});
     const [msg, setMsg] = useState(null);
 
-    const loadAll = useCallback(function () {
-      Promise.all([
-        SDK.fetchJSON(`${API}/orchestration`),
-        SDK.fetchJSON(`${API}/profiles`),
-      ]).then(function (results) {
-        setSettings(results[0] || null);
-        setProfiles((results[1] && results[1].profiles) || []);
+    const loadOrchestration = useCallback(function () {
+      return SDK.fetchJSON(`${API}/orchestration`).then(function (res) {
+        setSettings(res || null);
         setMsg(null);
+        return res;
       }).catch(function (err) {
         setMsg({ ok: false, text: "Failed to load: " + (err.message || String(err)) });
       });
     }, []);
 
+    const loadProfiles = useCallback(function () {
+      return SDK.fetchJSON(`${API}/profiles`).then(function (res) {
+        setProfiles((res && res.profiles) || []);
+        return res;
+      }).catch(function (err) {
+        setMsg({ ok: false, text: "Failed to load profiles: " + (err.message || String(err)) });
+      });
+    }, []);
+
+    const loadAll = useCallback(function () {
+      return Promise.all([loadOrchestration(), loadProfiles()]);
+    }, [loadOrchestration, loadProfiles]);
+
     useEffect(function () {
-      // Load on mount so the collapsed pill shows the real mode without
-      // requiring the user to expand the panel first.
-      if (settings === null) loadAll();
-    }, [settings, loadAll]);
+      if (settings === null) loadOrchestration();
+    }, [settings, loadOrchestration]);
+
+    useEffect(function () {
+      if (expanded && profiles.length === 0) loadProfiles();
+    }, [expanded, profiles.length, loadProfiles]);
 
     const saveSettings = function (patch) {
       setMsg(null);
