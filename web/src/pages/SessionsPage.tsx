@@ -77,28 +77,6 @@ const SOURCE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> =
     cron: { icon: Clock, color: "text-warning" },
   };
 
-const PUBLISHED_DASHBOARDS = [
-  { name: "dashboard", href: "https://x.gqb.bar/dashboard" },
-  { name: "daily-status", href: "https://x.gqb.bar/daily-status" },
-  {
-    name: "legal-skills-operations",
-    href: "https://x.gqb.bar/legal-skills-operations",
-  },
-  {
-    name: "legal-skills-suite-architecture",
-    href: "https://x.gqb.bar/legal-skills-suite-architecture",
-  },
-  { name: "invoice-dashboard", href: "https://x.gqb.bar/invoice-dashboard" },
-  {
-    name: "scout-suggestions-dashboard",
-    href: "https://x.gqb.bar/scout-suggestions-dashboard",
-  },
-  {
-    name: "cron-authority-dashboard",
-    href: "https://x.gqb.bar/cron-authority-dashboard",
-  },
-  { name: "spec-kit-dashboard", href: "https://x.gqb.bar/spec-kit-dashboard" },
-] as const;
 
 /** Render an FTS5 snippet with highlighted matches.
  *  The backend wraps matches in >>> and <<< delimiters. */
@@ -1681,34 +1659,6 @@ export default function SessionsPage() {
           {platformEntries.length > 0 && status && (
             <PlatformsCard platforms={platformEntries} />
           )}
-
-          <Card className="min-w-0 max-w-full overflow-hidden">
-            <CardHeader className="min-w-0">
-              <div className="flex min-w-0 items-center gap-2">
-                <Globe className="h-5 w-5 shrink-0 text-muted-foreground" />
-                <CardTitle className="min-w-0 truncate text-base">
-                  Published Dashboards
-                </CardTitle>
-              </div>
-            </CardHeader>
-
-            <CardContent className="grid min-w-0 gap-3 sm:grid-cols-2">
-              {PUBLISHED_DASHBOARDS.map(({ name, href }) => (
-                <a
-                  key={href}
-                  href={href}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex min-w-0 flex-col gap-1 border border-border p-3 text-sm text-primary transition-colors hover:border-primary/40 hover:bg-background-base/40 hover:underline"
-                >
-                  <span className="font-medium">{name}</span>
-                  <span className="font-mono-ui text-xs text-muted-foreground [overflow-wrap:anywhere]">
-                    {href}
-                  </span>
-                </a>
-              ))}
-            </CardContent>
-          </Card>
 
           {recentSessions.length > 0 && (
             <Card className="min-w-0 max-w-full overflow-hidden">

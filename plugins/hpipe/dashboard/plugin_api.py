@@ -7,6 +7,7 @@ CLI output where available. No writes, dispatches, or external calls happen here
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -113,8 +114,11 @@ _THRESHOLD_POLICY = {
     "mutation_surface": "none",
     "tuning_surface": "plugins/hpipe/dashboard/plugin_api.py::_DEFAULT_THRESHOLDS",
 }
-_RUN_INDEX_FALLBACK = Path(
-    "/home/david/workspace/skills/autonomous-ai-agents/agent-pipeline-shorthand/RUN_INDEX.md"
+_RUN_INDEX_FALLBACK_ENV = "HPIPE_RUN_INDEX_PATH"
+_RUN_INDEX_FALLBACK = (
+    Path(os.environ[_RUN_INDEX_FALLBACK_ENV])
+    if os.environ.get(_RUN_INDEX_FALLBACK_ENV)
+    else get_hermes_home() / "hpipe" / "RUN_INDEX.md"
 )
 _RUN_INDEX_ENTRY_RE = re.compile(r"^- (\d{4}-\d{2}-\d{2}) — (.+?) — (.+?) — (.+)$")
 _RUN_INDEX_UI_PREVIEW_LIMIT = 10
