@@ -2010,6 +2010,42 @@ def _board_counts(slug: str) -> dict[str, int]:
         return {}
 
 
+def _board_last_worked_at(slug: str) -> int | None:
+    """Return the most recent activity timestamp for a board.
+
+    Treat task creation, task state transitions, comments, and runs as work.
+    If a board has never had any task activity, return ``None`` so callers can
+    fall back to the board creation timestamp.
+    """
+    try:
+        path = kanban_db.kanban_db_path(board=slug)
+        if not path.exists():
+            return None
+        conn = kanban_db.connect(board=slug)
+        try:
+            row = conn.execute(
+                """
+                SELECT MAX(ts) AS last_worked_at
+                FROM (
+                    SELECT MAX(created_at) AS ts FROM tasks
+                    UNION ALL SELECT MAX(started_at) AS ts FROM tasks WHERE started_at IS NOT NULL
+                    UNION ALL SELECT MAX(completed_at) AS ts FROM tasks WHERE completed_at IS NOT NULL
+                    UNION ALL SELECT MAX(created_at) AS ts FROM task_comments
+                    UNION ALL SELECT MAX(created_at) AS ts FROM task_events
+                    UNION ALL SELECT MAX(started_at) AS ts FROM task_runs
+                    UNION ALL SELECT MAX(ended_at) AS ts FROM task_runs WHERE ended_at IS NOT NULL
+                )
+                """
+            ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            return int(row[0])
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
 @router.get("/boards")
 def list_boards(include_archived: bool = Query(False)):
     """Return every board on disk with task counts and the active slug."""
@@ -2019,6 +2055,7 @@ def list_boards(include_archived: bool = Query(False)):
         b["is_current"] = (b["slug"] == current)
         b["counts"] = _board_counts(b["slug"])
         b["total"] = sum(b["counts"].values())
+        b["last_worked_at"] = _board_last_worked_at(b["slug"]) or b.get("created_at")
     return {"boards": boards, "current": current}
 
 

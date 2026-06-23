@@ -86,6 +86,21 @@
     return body || raw;
   }
 
+  function formatBoardTimestamp(ts) {
+    if (!ts) return "n/a";
+    try {
+      return new Date(ts * 1000).toLocaleString(undefined, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      });
+    } catch (_e) {
+      return String(ts);
+    }
+  }
+
   // Order matches BOARD_COLUMNS in plugin_api.py.
   const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
@@ -1810,6 +1825,8 @@
     const current = list.find(function (b) { return b.slug === props.board; });
     const currentName = current && current.name ? current.name : props.board;
     const currentTotal = current ? current.total : 0;
+    const currentCreatedAt = current && current.created_at ? current.created_at : null;
+    const currentLastWorkedAt = current && current.last_worked_at ? current.last_worked_at : currentCreatedAt;
     const hasMultipleBoards = list.length > 1;
 
     // Hide entirely when only the default board exists AND it's empty —
@@ -1838,22 +1855,43 @@
         h("div", { className: "flex flex-col gap-0.5" },
           h("div", { className: "text-[11px] tracking-wider text-muted-foreground" },
             tx(t, "board", "Board")),
-          h("div", { className: "flex items-center gap-2" },
+          h("div", { className: "flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center" },
             h(Select, Object.assign({
               value: props.board,
-              className: "h-8 min-w-[220px]",
+              className: "h-8 w-full min-w-0 sm:flex-1 sm:min-w-[220px] lg:max-w-[420px]",
               "aria-label": "Switch kanban board",
               title: "Boards are independent work streams. Each board has its own tasks, tenants, and assignees.",
             }, selectChangeHandler(function (v) { if (v) props.onSwitch(v); })),
               list.map(function (b) {
-                const label = b.total > 0
-                  ? `${b.name || b.slug} · ${b.total}`
-                  : (b.name || b.slug);
-                return h(SelectOption, { key: b.slug, value: b.slug }, label);
+                return h(SelectOption, {
+                  key: b.slug,
+                  value: b.slug,
+                }, b.total > 0 ? `${b.name || b.slug} · ${b.total}` : (b.name || b.slug));
               }),
             ),
             h("span", { className: "text-xs text-muted-foreground" },
               `${currentTotal || 0} task${currentTotal === 1 ? "" : "s"}`),
+            h("div", { className: "flex flex-col gap-0.5" },
+              h("div", { className: "text-[10px] uppercase tracking-wider text-muted-foreground" },
+                "Board timestamps"),
+              h("div", { className: "text-xs text-muted-foreground" },
+                `Created ${formatBoardTimestamp(currentCreatedAt)} · Last worked ${formatBoardTimestamp(currentLastWorkedAt)}`),
+            ),
+          ),
+          h("div", { className: "mt-1 grid gap-1 text-[11px] leading-4 text-muted-foreground sm:grid-cols-2 lg:grid-cols-3" },
+            list.map(function (b) {
+              return h("div", {
+                key: b.slug,
+                className: "flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5 rounded-md border border-border/40 bg-muted/10 px-2 py-1",
+              },
+                h("span", { className: "font-medium text-foreground" },
+                  `${b.name || b.slug}${b.total > 0 ? ` · ${b.total}` : ""}`),
+                h("span", null,
+                  `· Created ${formatBoardTimestamp(b.created_at)}`),
+                h("span", null,
+                  `· Last worked ${formatBoardTimestamp(b.last_worked_at || b.created_at)}`),
+              );
+            }),
           ),
         ),
         h("div", { className: "flex-1" }),

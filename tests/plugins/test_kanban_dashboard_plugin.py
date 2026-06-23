@@ -209,6 +209,37 @@ def test_dashboard_select_filters_use_sdk_value_change_handler():
     assert "onChange: function (e)" in js
     assert "selectChangeHandler(props.setTenantFilter)" in js
     assert "selectChangeHandler(props.setAssigneeFilter)" in js
+    assert "function formatBoardTimestamp(ts)" in js
+    assert "Board timestamps" in js
+    assert "Created ${formatBoardTimestamp(currentCreatedAt)} · Last worked ${formatBoardTimestamp(currentLastWorkedAt)}" in js
+    assert "sm:flex-row sm:flex-wrap sm:items-center" in js
+    assert "w-full min-w-0 sm:flex-1 sm:min-w-[220px] lg:max-w-[420px]" in js
+    assert "mt-1 grid gap-1 text-[11px] leading-4 text-muted-foreground sm:grid-cols-2 lg:grid-cols-3" in js
+    assert "rounded-md border border-border/40 bg-muted/10 px-2 py-1" in js
+
+
+def test_dashboard_board_list_includes_created_and_last_worked_at(client):
+    """The boards endpoint should surface board creation and last-worked times."""
+
+    kb.create_board("alpha")
+    conn = kb.connect(board="alpha")
+    try:
+        created_at = kb.read_board_metadata("alpha")["created_at"]
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                ("fake-task", "jessi", "touching grass", created_at + 120),
+            )
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/boards")
+    assert r.status_code == 200
+    data = r.json()["boards"]
+    alpha = next(b for b in data if b["slug"] == "alpha")
+    assert alpha["created_at"] == created_at
+    assert alpha["last_worked_at"] == created_at + 120
+    assert alpha["total"] == 0
 
 
 def test_dashboard_client_side_filtering_includes_tenant_filter():

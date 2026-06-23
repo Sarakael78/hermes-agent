@@ -1,0 +1,14 @@
+{
+  "name": "hpipe",
+  "label": "Hpipe",
+  "description": "Hpipe operator cockpit — health strip, KPIs, concurrency timeline, leaderboards, staleness, evidence coverage, failure analysis, recent boards/runs, and drill-down helpers",
+  "icon": "Activity",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/hpipe",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
