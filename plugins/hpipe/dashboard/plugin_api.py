@@ -1109,6 +1109,7 @@ def _historical_stats(run_index: dict[str, Any], boards: list[dict[str, Any]], r
         "hpipe_slug_count": len({str(entry.get("board_or_run") or entry.get("slug") or "") for entry in entries if entry.get("board_or_run") or entry.get("slug")}),
         "index_only_count": reconciliation.get("index_only_count", 0),
         "board_only_count": reconciliation.get("live_board_only_count", reconciliation.get("board_only_count", 0)),
+        "archived_board_only_count": reconciliation.get("archived_board_only_count", 0),
         "matched_count": reconciliation.get("matched_count", 0),
         "archived_board_match_count": reconciliation.get("archived_board_match_count", 0),
         "top_terms": [{"term": term, "count": count} for term, count in term_counter.most_common(12)],
@@ -1475,28 +1476,33 @@ def _reconcile_boards_and_run_index(boards: list[dict[str, Any]], run_index: dic
     matched = sorted(live_board_slugs & index_slugs)
     archived_matches = sorted(index_slugs & (archived_physical | archived_base))
     live_board_only = sorted(live_board_slugs - index_slugs)
+    archived_board_only = sorted(archived_base - index_slugs - live_board_slugs)
     index_only = sorted(index_slugs - live_board_slugs - set(archived_matches))
     return {
         "matched_count": len(matched),
         "live_board_only_count": len(live_board_only),
         "board_only_count": len(live_board_only),
+        "archived_board_only_count": len(archived_board_only),
         "archived_board_match_count": len(archived_matches),
         "index_only_count": len(index_only),
         "matched": matched[:50],
         "live_board_only": live_board_only[:50],
         "board_only": live_board_only[:50],
+        "archived_board_only": archived_board_only[:50],
         "archived_board_matches": archived_matches[:50],
         "index_only": index_only[:50],
         "counts": {
             "matched": len(matched),
             "live_board_only": len(live_board_only),
+            "archived_board_only": len(archived_board_only),
             "archived_board_matches": len(archived_matches),
             "index_only": len(index_only),
             "run_index_entries": int(run_index.get("all_entry_count") or run_index.get("entry_count") or len(index_slugs)),
             "live_hpipe_boards": len(live_board_slugs),
             "archived_hpipe_boards": len(archived_physical),
+            "archived_hpipe_board_bases": len(archived_base),
         },
-        "explanation": "Full-history reconciliation compares all RUN_INDEX.md board/run slugs with current live hpipe-looking Kanban board directories and archived board directories. Index-only means historical metadata has no visible live/archived local board directory; live-board-only means local board telemetry exists without a run-index metadata row.",
+        "explanation": "Full-history reconciliation compares all RUN_INDEX.md board/run slugs with current live hpipe-looking Kanban board directories and archived board directories in both directions. Index-only means historical metadata has no visible live/archived local board directory; live-board-only means live telemetry exists without a run-index metadata row; archived-board-only means archived evidence exists without a run-index metadata row.",
     }
 
 
@@ -1510,7 +1516,9 @@ def _diagnostics_payload(boards: list[dict[str, Any]], run_index: dict[str, Any]
             "This can be a healthy idle state, an empty staged board, a ghost board, archived/missing task data, or run-index metadata that has drifted from Kanban storage.",
         ])
     if reconciliation.get("board_only_count"):
-        reasons.append(f"{reconciliation['board_only_count']} board(s) have no matching run-index entry.")
+        reasons.append(f"{reconciliation['board_only_count']} live board(s) have no matching run-index entry.")
+    if reconciliation.get("archived_board_only_count"):
+        reasons.append(f"{reconciliation['archived_board_only_count']} archived board(s) have no matching run-index entry.")
     if reconciliation.get("index_only_count"):
         reasons.append(f"{reconciliation['index_only_count']} run-index entr(y/ies) have no matching visible board.")
     if not reasons:
@@ -1537,7 +1545,7 @@ def _next_actions_payload(boards: list[dict[str, Any]], reconciliation: dict[str
     actions: list[dict[str, Any]] = []
     if int((summary.get("proof_coverage") or summary.get("evidence_coverage") or {}).get("tasks_total") or 0) == 0 and boards:
         actions.append({"priority": "high", "label": "Diagnose zero-state boards", "command": "hpipe board-lint <board>", "read_only": True})
-    if reconciliation.get("board_only_count") or reconciliation.get("index_only_count"):
+    if reconciliation.get("board_only_count") or reconciliation.get("archived_board_only_count") or reconciliation.get("index_only_count"):
         actions.append({"priority": "high", "label": "Reconcile boards and run index", "command": "hpipe run-index --json && hpipe status", "read_only": True})
     if int(summary.get("failed_runs") or 0):
         actions.append({"priority": "high", "label": "Inspect failed runs", "command": "hpipe fail-log <board>", "read_only": True})
