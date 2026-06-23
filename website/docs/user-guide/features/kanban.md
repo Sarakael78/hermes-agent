@@ -120,6 +120,54 @@ hermes kanban boards rm atm10-server
 hermes kanban boards rm atm10-server --delete
 ```
 
+### Repo-linked git closeout policy
+
+Repo-linked boards can store conservative git metadata for engineering work.
+This is a closeout planning lane, not a global auto-push switch. The default is
+`dry-run`, and the bounded MVP does not execute external GitHub actions.
+
+```bash
+# Attach a repo to the board. Defaults to report-only dry-run.
+hermes kanban --board atm10-server repo link --path /path/to/repo
+
+# Permit local commit planning only for scoped paths.
+hermes kanban --board atm10-server repo link \
+    --path /path/to/repo \
+    --policy local-commit \
+    --allowed-path src/ \
+    --allowed-path tests/
+
+# Build a closeout plan for a task. Commands are printed; they are not run.
+hermes kanban --board atm10-server repo plan t_1234abcd \
+    --scope src/ \
+    --scope tests/ \
+    --verification-command "pytest tests/hermes_cli/test_kanban_git.py" \
+    --verification-passed
+```
+
+Policies:
+
+- `dry-run` — report only; no git commands are planned.
+- `local-branch` — plan a namespaced local branch such as
+  `kanban/<board>/<task-id>`.
+- `local-commit` — plan exact `git add -- <file>` commands and a commit message
+  containing the board/task id, but only after explicit scopes and successful
+  verification are supplied.
+- `push-branch` / `draft-pr` — recognised as policy tiers, but blocked by the
+  MVP as external actions. Use a gated follow-up before enabling real push/PR
+  execution.
+
+Guardrails:
+
+- no `git add .`;
+- no default-branch push/closeout;
+- dirty paths must be inside explicit `--scope` values and any board
+  `--allowed-path` list;
+- commit-or-higher policies require successful verification evidence;
+- legal/client/confidential boards are refused unless explicitly whitelisted;
+- push/PR remains an authority-gated external act.
+
+
 Board resolution order (highest precedence first):
 
 1. Explicit `--board <slug>` on the CLI call.

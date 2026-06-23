@@ -491,6 +491,42 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit JSON (structured) instead of the default human table",
     )
 
+    # --- repo (safe git closeout planning) ---
+    p_repo = sub.add_parser(
+        "repo",
+        help="Attach repo metadata and build safe git closeout plans for this board",
+        description=(
+            "Repo-linked board closeout policy. Defaults are deliberately local and "
+            "report-only: push/PR lanes require explicit board policy and are not "
+            "executed by the bounded MVP."
+        ),
+    )
+    repo_sub = p_repo.add_subparsers(dest="repo_action")
+
+    r_link = repo_sub.add_parser("link", help="Attach or update repo metadata on a board")
+    r_link.add_argument("--path", required=True, help="Path to the related git repository")
+    r_link.add_argument(
+        "--policy",
+        default="dry-run",
+        choices=["dry-run", "local-branch", "local-commit", "push-branch", "draft-pr"],
+        help="Maximum closeout lane for this board (default: dry-run)",
+    )
+    r_link.add_argument("--remote", default="origin")
+    r_link.add_argument("--default-branch", default="main")
+    r_link.add_argument("--branch-prefix", default="kanban")
+    r_link.add_argument("--allowed-path", action="append", default=[], dest="allowed_paths")
+    r_link.add_argument("--confidentiality", default="normal")
+    r_link.add_argument("--allow-confidential", action="store_true")
+    r_link.add_argument("--json", action="store_true")
+
+    r_plan = repo_sub.add_parser("plan", help="Build a dry-run git closeout plan for a task")
+    r_plan.add_argument("task_id")
+    r_plan.add_argument("--scope", action="append", default=[], dest="scopes")
+    r_plan.add_argument("--verification-command", action="append", default=[], dest="verification_commands")
+    r_plan.add_argument("--verification-passed", action="store_true")
+    r_plan.add_argument("--branch", default=None, dest="branch_name")
+    r_plan.add_argument("--json", action="store_true")
+
     # --- link / unlink ---
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
     p_link.add_argument("parent_id")
@@ -932,6 +968,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
+            "repo":     _cmd_repo,
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
@@ -1647,6 +1684,57 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
         + (" (claim reclaimed)" if getattr(args, "reclaim", False) else "")
     )
     return 0
+
+
+def _cmd_repo(args: argparse.Namespace) -> int:
+    """Manage repo-linked board metadata and safe git closeout plans."""
+    from hermes_cli import kanban_git as kg
+
+    action = getattr(args, "repo_action", None)
+    if not action:
+        print("kanban repo: choose 'link' or 'plan'", file=sys.stderr)
+        return 2
+
+    board = getattr(args, "board", None) or kb.get_current_board()
+    if action == "link":
+        policy = kg.link_board_repo_policy(
+            board,
+            repo_path=args.path,
+            closeout_policy=args.policy,
+            remote=args.remote,
+            default_branch=args.default_branch,
+            branch_prefix=args.branch_prefix,
+            allowed_paths=args.allowed_paths,
+            confidentiality=args.confidentiality,
+            allow_confidential=bool(args.allow_confidential),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(policy.to_dict(), indent=2, ensure_ascii=False))
+        else:
+            print(f"Linked board {policy.board} to repo {policy.repo_path}")
+            print(f"Policy: {policy.closeout_policy}")
+            if policy.allowed_paths:
+                print("Allowed paths: " + ", ".join(policy.allowed_paths))
+        return 0
+
+    if action == "plan":
+        plan = kg.build_closeout_plan(
+            board,
+            args.task_id,
+            scopes=args.scopes,
+            verification_commands=args.verification_commands,
+            verification_passed=bool(args.verification_passed),
+            branch_name=args.branch_name,
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(plan.to_dict(), indent=2, ensure_ascii=False))
+        else:
+            print(kg.render_plan(plan))
+        return 0 if plan.status == "ready" else 1
+
+    print(f"kanban repo: unknown action {action!r}", file=sys.stderr)
+    return 2
+
 
 
 def _cmd_diagnostics(args: argparse.Namespace) -> int:
