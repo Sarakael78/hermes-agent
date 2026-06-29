@@ -1335,6 +1335,34 @@ def _openrouter_model_supports_tools(item: Any) -> bool:
     return "tools" in params
 
 
+def _openrouter_free_models_only() -> bool:
+    """Return whether the OpenRouter picker should surface free models only."""
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        openrouter_cfg = config.get("openrouter", {})
+        if not isinstance(openrouter_cfg, dict):
+            return False
+        raw = openrouter_cfg.get("free_models_only", False)
+    except Exception:
+        return False
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(raw)
+
+
+def _openrouter_catalog_entry_is_free(model_id: str, description: str) -> bool:
+    """Best-effort free marker for cached/fallback OpenRouter catalog entries."""
+    desc = str(description or "").strip().lower()
+    mid = str(model_id or "").strip().lower()
+    return desc == "free" or mid.endswith(":free") or mid in {
+        "openrouter/elephant-alpha",
+        "openrouter/owl-alpha",
+        "openrouter/free",
+    }
+
+
 def fetch_openrouter_models(
     timeout: float = 8.0,
     *,
@@ -1343,8 +1371,16 @@ def fetch_openrouter_models(
     """Return the curated OpenRouter picker list, refreshed from the live catalog when possible."""
     global _openrouter_catalog_cache
 
+    free_only = _openrouter_free_models_only()
     if _openrouter_catalog_cache is not None and not force_refresh:
-        return list(_openrouter_catalog_cache)
+        cached = list(_openrouter_catalog_cache)
+        if free_only:
+            cached = [
+                (mid, desc)
+                for mid, desc in cached
+                if _openrouter_catalog_entry_is_free(mid, desc)
+            ]
+        return cached
 
     # Prefer the remotely-hosted catalog manifest; fall back to the in-repo
     # snapshot when the manifest is unreachable. Both are curated lists that
@@ -1356,6 +1392,12 @@ def fetch_openrouter_models(
     except Exception:
         remote = None
     fallback = list(remote) if remote else list(OPENROUTER_MODELS)
+    if free_only:
+        fallback = [
+            (mid, desc)
+            for mid, desc in fallback
+            if _openrouter_catalog_entry_is_free(mid, desc)
+        ]
     preferred_ids = [mid for mid, _ in fallback]
 
     try:
@@ -1391,14 +1433,17 @@ def fetch_openrouter_models(
         # when the user selects them. Ported from Kilo-Org/kilocode#9068.
         if not _openrouter_model_supports_tools(live_item):
             continue
-        desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
+        is_free = _openrouter_model_is_free(live_item.get("pricing"))
+        if free_only and not is_free:
+            continue
+        desc = "free" if is_free else ""
         curated.append((preferred_id, desc))
 
     if not curated:
         return list(_openrouter_catalog_cache or fallback)
 
     first_id, _ = curated[0]
-    curated[0] = (first_id, "recommended")
+    curated[0] = (first_id, "free, recommended" if free_only else "recommended")
     _openrouter_catalog_cache = curated
     return list(curated)
 
@@ -2536,6 +2581,12 @@ def _credential_fingerprint(provider: str) -> str:
                 parts.append(f"{bev}={_os.environ.get(bev, '')}")
     except Exception:
         pass
+
+    # OpenRouter's free-only setting changes the effective catalog, so fold it
+    # into the cache fingerprint; otherwise a pre-toggle paid catalog could
+    # remain visible until the generic TTL expires.
+    if normalize_provider(provider) == "openrouter":
+        parts.append(f"openrouter.free_models_only={_openrouter_free_models_only()}")
 
     # OAuth / external-file mtimes that change on re-auth
     try:
